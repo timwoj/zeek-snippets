@@ -1,0 +1,241 @@
+diff --git a/scripts/base/packet-protocols/udp/main.zeek b/scripts/base/packet-protocols/udp/main.zeek
+index f963f5052..3ce8001b0 100644
+--- a/scripts/base/packet-protocols/udp/main.zeek
++++ b/scripts/base/packet-protocols/udp/main.zeek
+@@ -1,5 +1,6 @@
+-module PacketAnalyzer::UDP;
++module PacketAnalyzer::UDP_PKT;
+ 
+-event zeek_init() &priority=20
+-	{
+-	}
++export {
++	## Default analyzer
++	const default_analyzer: PacketAnalyzer::Tag = PacketAnalyzer::ANALYZER_IPSESSION &redef;
++}
+diff --git a/src/packet_analysis/Analyzer.h b/src/packet_analysis/Analyzer.h
+index 90a3508ac..e03578407 100644
+--- a/src/packet_analysis/Analyzer.h
++++ b/src/packet_analysis/Analyzer.h
+@@ -161,9 +161,11 @@ protected:
+ 	void Weird(const char* name, Packet* packet=nullptr, const char* addl="") const;
+ 
+ private:
++
+ 	Tag tag;
+ 	Dispatcher dispatcher;
+ 	AnalyzerPtr default_analyzer = nullptr;
++	std::vector<std::function<void()>> session_functions;
+ 
+ 	void Init(const Tag& tag);
+ };
+diff --git a/src/packet_analysis/protocol/icmp/ICMP.cc b/src/packet_analysis/protocol/icmp/ICMP.cc
+index 848af1023..693721b24 100644
+--- a/src/packet_analysis/protocol/icmp/ICMP.cc
++++ b/src/packet_analysis/protocol/icmp/ICMP.cc
+@@ -59,7 +59,7 @@ bool ICMPAnalyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* packet
+ 	return true;
+ 	}
+ 
+-void ICMPAnalyzer::ContinueProcessing(Connection* c, double t, bool is_orig, int remaining, const Packet* pkt)
++void ICMPAnalyzer::ContinueProcessing(Connection* c, double t, bool is_orig, int remaining, Packet* pkt)
+ 	{
+ 	conn = c;
+ 	session_analyzer = static_cast<IPBasedTransportAnalyzer*>(conn->GetRootAnalyzer());
+diff --git a/src/packet_analysis/protocol/icmp/ICMP.h b/src/packet_analysis/protocol/icmp/ICMP.h
+index c10c32f42..109fcb970 100644
+--- a/src/packet_analysis/protocol/icmp/ICMP.h
++++ b/src/packet_analysis/protocol/icmp/ICMP.h
+@@ -45,7 +45,7 @@ protected:
+ 	TransportProto GetTransportProto() const override { return TRANSPORT_ICMP; }
+ 
+ 	void ContinueProcessing(Connection* c, double t, bool is_orig, int remaining,
+-	                        const Packet* pkt) override;
++	                        Packet* pkt) override;
+ 
+ private:
+ 
+diff --git a/src/packet_analysis/protocol/ip/IPBasedAnalyzer.cc b/src/packet_analysis/protocol/ip/IPBasedAnalyzer.cc
+index edd217e1e..d45c4b0cc 100644
+--- a/src/packet_analysis/protocol/ip/IPBasedAnalyzer.cc
++++ b/src/packet_analysis/protocol/ip/IPBasedAnalyzer.cc
+@@ -20,7 +20,7 @@ IPBasedAnalyzer::~IPBasedAnalyzer()
+ 	{
+ 	}
+ 
+-void IPBasedAnalyzer::ProcessConnectionICMP(const ConnID& conn_id, const Packet* pkt, size_t remaining)
++void IPBasedAnalyzer::ProcessConnectionICMP(const ConnID& conn_id, Packet* pkt, size_t remaining)
+ 	{
+ 	icmp = true;
+ 	const std::unique_ptr<IP_Hdr>& ip_hdr = pkt->ip_hdr;
+@@ -106,7 +106,7 @@ void IPBasedAnalyzer::ProcessConnectionICMP(const ConnID& conn_id, const Packet*
+ 		}
+ 	}
+ 
+-void IPBasedAnalyzer::ProcessConnection(const ConnID& conn_id, const Packet* pkt, size_t remaining)
++void IPBasedAnalyzer::ProcessConnection(const ConnID& conn_id, Packet* pkt, size_t remaining)
+ 	{
+ 	const std::unique_ptr<IP_Hdr>& ip_hdr = pkt->ip_hdr;
+ 	detail::ConnIDKey key = detail::BuildConnIDKey(conn_id);
+diff --git a/src/packet_analysis/protocol/ip/IPBasedAnalyzer.h b/src/packet_analysis/protocol/ip/IPBasedAnalyzer.h
+index 8fbf59afc..fc3471f5f 100644
+--- a/src/packet_analysis/protocol/ip/IPBasedAnalyzer.h
++++ b/src/packet_analysis/protocol/ip/IPBasedAnalyzer.h
+@@ -49,7 +49,7 @@ protected:
+ 	 * @param pkt The packet being processed.
+ 	 * @param remaining The number of bytes remaining to be processed in the packet.
+ 	 */
+-	void ProcessConnectionICMP(const ConnID& conn_id, const Packet* pkt, size_t remaining);
++	void ProcessConnectionICMP(const ConnID& conn_id, Packet* pkt, size_t remaining);
+ 
+ 	/**
+ 	 * Entry point for child classes to call to do the actual heavy lifting for
+@@ -59,7 +59,7 @@ protected:
+ 	 * @param pkt The packet being processed.
+ 	 * @param remaining The number of bytes remaining to be processed in the packet.
+ 	 */
+-	void ProcessConnection(const ConnID& conn_id, const Packet* pkt, size_t remaining);
++	void ProcessConnection(const ConnID& conn_id, Packet* pkt, size_t remaining);
+ 
+ 	/**
+ 	 * Verifies that there is enough data in the packet to process the header
+@@ -112,7 +112,7 @@ protected:
+ 	bool IsLikelyServerPort(uint32_t port) const;
+ 
+ 	virtual void ContinueProcessing(Connection* conn, double t, bool is_orig, int remaining,
+-	                                const Packet* pkt) {}
++	                                Packet* pkt) {}
+ 
+ 	/**
+ 	 * The entry point to the session analysis framework. This should be reset between calls
+diff --git a/src/packet_analysis/protocol/ip/IPSessionAnalyzer.cc b/src/packet_analysis/protocol/ip/IPSessionAnalyzer.cc
+new file mode 100644
+index 000000000..9a16547ab
+--- /dev/null
++++ b/src/packet_analysis/protocol/ip/IPSessionAnalyzer.cc
+@@ -0,0 +1 @@
++#include "zeek/packet_analysis/protocol/ip/IPSessionAnalyzer.h"
+diff --git a/src/packet_analysis/protocol/ip/IPSessionAnalyzer.h b/src/packet_analysis/protocol/ip/IPSessionAnalyzer.h
+new file mode 100644
+index 000000000..3f3e46dcd
+--- /dev/null
++++ b/src/packet_analysis/protocol/ip/IPSessionAnalyzer.h
+@@ -0,0 +1,37 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#pragma once
++
++#include "zeek/packet_analysis/Analyzer.h"
++#include "zeek/packet_analysis/Component.h"
++
++namespace zeek::packet_analysis::IP {
++
++/**
++ * This analyzer is the interface from the packet analyzer framework to the
++ * session analyzer framework. It can be used as a default analyzer for
++ * packet analyzers.
++ */
++class IPSessionAnalyzer : public Analyzer {
++public:
++	IPSessionAnalyzer() : Analyzer("IPSession") {}
++
++	bool AnalyzePacket(size_t len, const uint8_t* data, Packet* packet) override
++		{
++		if ( analyzers.empty() )
++			return false;
++
++		(analyzers.back())();
++		analyzers.pop_back();
++		return true;
++		}
++
++	static zeek::packet_analysis::AnalyzerPtr Instantiate()
++		{
++		return std::make_shared<IPSessionAnalyzer>();
++		}
++
++	std::vector<std::function<void()>> analyzers;
++};
++
++}
+diff --git a/src/packet_analysis/protocol/ip/Plugin.cc b/src/packet_analysis/protocol/ip/Plugin.cc
+index 31ef82c66..15fb2cec5 100644
+--- a/src/packet_analysis/protocol/ip/Plugin.cc
++++ b/src/packet_analysis/protocol/ip/Plugin.cc
+@@ -3,6 +3,7 @@
+ #include "zeek/plugin/Plugin.h"
+ #include "zeek/packet_analysis/Component.h"
+ #include "zeek/packet_analysis/protocol/ip/IP.h"
++#include "zeek/packet_analysis/protocol/ip/IPSessionAnalyzer.h"
+ 
+ namespace zeek::plugin::Zeek_IP {
+ 
+@@ -12,6 +13,8 @@ public:
+ 		{
+ 		AddComponent(new zeek::packet_analysis::Component("IP",
+ 		                 zeek::packet_analysis::IP::IPAnalyzer::Instantiate));
++		AddComponent(new zeek::packet_analysis::Component("IPSession",
++		                 zeek::packet_analysis::IP::IPSessionAnalyzer::Instantiate));
+ 
+ 		zeek::plugin::Configuration config;
+ 		config.name = "Zeek::IP";
+diff --git a/src/packet_analysis/protocol/udp/UDP.cc b/src/packet_analysis/protocol/udp/UDP.cc
+index 69f09f0a7..b19facfb3 100644
+--- a/src/packet_analysis/protocol/udp/UDP.cc
++++ b/src/packet_analysis/protocol/udp/UDP.cc
+@@ -7,6 +7,7 @@
+ #include "zeek/analyzer/Manager.h"
+ #include "zeek/analyzer/protocol/pia/PIA.h"
+ #include "zeek/analyzer/protocol/conn-size/ConnSize.h"
++#include "zeek/packet_analysis/protocol/ip/IPSessionAnalyzer.h"
+ 
+ #include "zeek/analyzer/protocol/udp/events.bif.h"
+ 
+@@ -66,7 +67,7 @@ void UDPAnalyzer::CreateTransportAnalyzer(Connection* conn, IPBasedTransportAnal
+ 
+ void UDPAnalyzer::Initialize()
+ 	{
+-	IPBasedAnalyzer::Initialize();
++	Analyzer::Initialize();
+ 
+ 	const auto& id = detail::global_scope()->Find("Tunnel::vxlan_ports");
+ 
+@@ -87,7 +88,8 @@ bool UDPAnalyzer::WantConnection(uint16_t src_port, uint16_t dst_port,
+ 	return true;
+ 	}
+ 
+-void UDPAnalyzer::ContinueProcessing(Connection* c, double t, bool is_orig, int remaining, const Packet* pkt)
++void UDPAnalyzer::ContinueProcessing(Connection* c, double t, bool is_orig,
++                                     int remaining, Packet* pkt)
+ 	{
+ 	req_chk_cnt = rep_chk_cnt = 0;
+ 	req_chk_thresh = rep_chk_thresh = 1;
+@@ -244,8 +246,13 @@ void UDPAnalyzer::ContinueProcessing(Connection* c, double t, bool is_orig, int
+ 		session_analyzer->Event(udp_reply);
+ 		}
+ 
+-	if ( remaining >= len )
+-		session_analyzer->ForwardPacket(len, data, is_orig, -1, ip.get(), remaining);
++	// Add the current transport analyzer to the stack for the dummy session analyzer so it
++	// gets called next.
++	IPSessionAnalyzer* ipsa = static_cast<IPSessionAnalyzer*>(packet_mgr->GetAnalyzer("IPSession").get());
++	ipsa->analyzers.push_back(std::bind(&UDPTransportAnalyzer::ForwardPacket, session_analyzer,
++	                                    len, data, is_orig, -1, ip.get(), remaining));
++
++	ForwardPacket(remaining, data, pkt);
+ 
+ 	conn = nullptr;
+ 	session_analyzer = nullptr;
+diff --git a/src/packet_analysis/protocol/udp/UDP.h b/src/packet_analysis/protocol/udp/UDP.h
+index ae4e9fc4b..3f9b33376 100644
+--- a/src/packet_analysis/protocol/udp/UDP.h
++++ b/src/packet_analysis/protocol/udp/UDP.h
+@@ -58,7 +58,7 @@ protected:
+ 	                    const u_char* data, bool& flip_roles) const override;
+ 
+ 	void ContinueProcessing(Connection* c, double t, bool is_orig, int remaining,
+-	                        const Packet* pkt) override;
++	                        Packet* pkt) override;
+ 
+ private:
+ 

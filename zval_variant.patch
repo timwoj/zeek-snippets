@@ -1,0 +1,390 @@
+diff --git a/src/Val.h b/src/Val.h
+index 02c2ab539..57887a3c9 100644
+--- a/src/Val.h
++++ b/src/Val.h
+@@ -1280,6 +1280,8 @@ public:
+ 			// TODO: should this be an error via reporter?
+ 			}
+ 
++//		if constexpr ( std::is_integral_v<T> )
++
+ 		// TODO: this only support types that can be reduced to the requested
+ 		// type. For example, StringVal should return an error here.
+ 		return T{};
+@@ -1295,27 +1297,20 @@ public:
+ 			}
+ 
+ 		if constexpr ( std::is_same_v<T, BoolVal> || std::is_same_v<T, IntVal> || std::is_same_v<T, EnumVal> )
+-			return record_val->at(field).int_val;
++			return std::get<bro_int_t>(record_val->at(field).var);
+ 		else if constexpr ( std::is_same_v<T, CountVal> )
+-			return record_val->at(field).uint_val;
++			return std::get<bro_uint_t>(record_val->at(field).var);
+ 		else if constexpr ( std::is_same_v<T, DoubleVal> || std::is_same_v<T, TimeVal> || std::is_same_v<T, IntervalVal> )
+-			return record_val->at(field).double_val;
+-		else if constexpr ( std::is_same_v<T, PortVal> )
+-			return val_mgr->Port(record_val->at(field).uint_val);
+-		else if constexpr ( std::is_same_v<T, StringVal> )
+-			return record_val->at(field).string_val->Get();
+-		else if constexpr ( std::is_same_v<T, AddrVal> )
+-			return record_val->at(field).addr_val->Get();
+-		else if constexpr ( std::is_same_v<T, SubNetVal> )
+-			return record_val->at(field).subnet_val->Get();
+-		else if constexpr ( std::is_same_v<T, File> )
+-			return *(record_val->at(field).file_val);
+-		else if constexpr ( std::is_same_v<T, Func> )
+-			return *(record_val->at(field).func_val);
+-		else if constexpr ( std::is_same_v<T, PatternVal> )
+-			return record_val->at(field).re_val->Get();
+-		else if constexpr ( std::is_same_v<T, TableVal> )
+-			return record_val->at(field).table_val->Get();
++			return std::get<double>(record_val->at(field).var);
++		else if constexpr ( std::is_same_v<T, PortVal> ||
++		                    std::is_same_v<T, StringVal> ||
++		                    std::is_same_v<T, AddrVal> ||
++		                    std::is_same_v<T, SubNetVal> ||
++		                    std::is_same_v<T, File> ||
++		                    std::is_same_v<T, Func> ||
++		                    std::is_same_v<T, PatternVal> ||
++		                    std::is_same_v<T, TableVal> )
++			return std::get<T*>(record_val->at(field).var)->Get();
+ 		else
+ 			{
+ 			// TODO: error here
+diff --git a/src/ZVal.cc b/src/ZVal.cc
+index 47087b175..18effc28b 100644
+--- a/src/ZVal.cc
++++ b/src/ZVal.cc
+@@ -46,7 +46,7 @@ ZVal::ZVal(ValPtr v, const TypePtr& t)
+ 		// We can deal with it iff the type is managed, and thus
+ 		// we can employ a "nil" placeholder.
+ 		ASSERT(IsManagedType(t));
+-		managed_val = nullptr;
++		v = nullptr;
+ 		return;
+ 		}
+ 
+@@ -63,49 +63,58 @@ ZVal::ZVal(ValPtr v, const TypePtr& t)
+ 	case TYPE_BOOL:
+ 	case TYPE_INT:
+ 	case TYPE_ENUM:
+-		int_val = v->AsInt();
++		var = v->AsInt();
+ 		break;
+ 
+ 	case TYPE_COUNT:
++		var = v->AsCount();
++		break;
++
+ 	case TYPE_PORT:
+-		uint_val = v->AsCount();
++		var = v.release()->AsPortVal();
+ 		break;
+ 
+ 	case TYPE_DOUBLE:
+ 	case TYPE_INTERVAL:
+ 	case TYPE_TIME:
+-		double_val = v->AsDouble();
++		var = v->AsDouble();
+ 		break;
+ 
+ 	case TYPE_FUNC:
+-		func_val = v->AsFunc();
+-		Ref(func_val);
++		{
++		Func* f = v->AsFunc();
++		var = f;
++		Ref(f);
+ 		break;
++		}
+ 
+ 	case TYPE_FILE:
+-		file_val = v->AsFile();
+-		Ref(file_val);
++		{
++		File* f = v->AsFile();
++		var = f;
++		Ref(f);
+ 		break;
++		}
+ 
+ 	case TYPE_LIST:
+-		list_val = v.release()->AsListVal();
++		var = v.release()->AsListVal();
+ 		break;
+ 
+ 	case TYPE_OPAQUE:
+-		opaque_val = v.release()->AsOpaqueVal();
++		var = v.release()->AsOpaqueVal();
+ 		break;
+ 
+ 	case TYPE_PATTERN:
+-		re_val = v.release()->AsPatternVal();
++		var = v.release()->AsPatternVal();
+ 		break;
+ 
+ 	case TYPE_TABLE:
+-		table_val = v.release()->AsTableVal();
++		var = v.release()->AsTableVal();
+ 		break;
+ 
+ 	case TYPE_VECTOR:
+ 		{
+-		vector_val = v.release()->AsVectorVal();
++		var = v.release()->AsVectorVal();
+ 
+ 		// Some run-time type-checking, sigh.
+ 		auto my_ytag = t->AsVectorType()->Yield()->Tag();
+@@ -129,27 +138,27 @@ ZVal::ZVal(ValPtr v, const TypePtr& t)
+ 		}
+ 
+ 	case TYPE_RECORD:
+-		record_val = v.release()->AsRecordVal();
++		var = v.release()->AsRecordVal();
+ 		break;
+ 
+ 	case TYPE_STRING:
+-		string_val = v.release()->AsStringVal();
++		var = v.release()->AsStringVal();
+ 		break;
+ 
+ 	case TYPE_ADDR:
+-		addr_val = v.release()->AsAddrVal();
++		var = v.release()->AsAddrVal();
+ 		break;
+ 
+ 	case TYPE_SUBNET:
+-		subnet_val = v.release()->AsSubNetVal();
++		var = v.release()->AsSubNetVal();
+ 		break;
+ 
+ 	case TYPE_ANY:
+-		any_val = v.release();
++		var = static_cast<Val*>(v.release());
+ 		break;
+ 
+ 	case TYPE_TYPE:
+-		type_val = t->Ref();
++		var = t->Ref();
+ 		break;
+ 
+ 	case TYPE_ERROR:
+@@ -166,65 +175,92 @@ ValPtr ZVal::ToVal(const TypePtr& t) const
+ 
+ 	switch ( t->Tag() ) {
+ 	case TYPE_INT:
+-		return val_mgr->Int(int_val);
++		return val_mgr->Int(std::get<bro_int_t>(var));
+ 
+ 	case TYPE_BOOL:
+-		return val_mgr->Bool(int_val ? true : false);
++		return val_mgr->Bool(std::get<bro_int_t>(var) ? true : false);
+ 
+ 	case TYPE_PORT:
+-		return val_mgr->Port(uint_val);
++		return {NewRef(), std::get<PortVal*>(var)};
+ 
+ 	case TYPE_COUNT:
+-		return val_mgr->Count(uint_val);
++		return val_mgr->Count(std::get<bro_uint_t>(var));
+ 
+ 	case TYPE_DOUBLE:
+-		return make_intrusive<DoubleVal>(double_val);
++		return make_intrusive<DoubleVal>(std::get<double>(var));
+ 
+ 	case TYPE_INTERVAL:
+-		return make_intrusive<IntervalVal>(double_val, Seconds);
++		return make_intrusive<IntervalVal>(std::get<double>(var), Seconds);
+ 
+ 	case TYPE_TIME:
+-		return make_intrusive<TimeVal>(double_val);
++		return make_intrusive<TimeVal>(std::get<double>(var));
+ 
+ 	case TYPE_ENUM:
+-		return t->AsEnumType()->GetEnumVal(int_val);
++		return t->AsEnumType()->GetEnumVal(std::get<bro_int_t>(var));
+ 
+ 	case TYPE_ANY:
+-		return {NewRef{}, any_val};
++		{
++		int index = var.index();
++		switch ( index )
++			{
++			case 3: return {NewRef(), std::get<StringVal*>(var)};
++			case 4: return {NewRef(), std::get<AddrVal*>(var)};
++			case 5: return {NewRef(), std::get<SubNetVal*>(var)};
++			case 8: return {NewRef(), std::get<ListVal*>(var)};
++			case 9: return {NewRef(), std::get<OpaqueVal*>(var)};
++			case 10: return {NewRef(), std::get<PatternVal*>(var)};
++			case 11: return {NewRef(), std::get<TableVal*>(var)};
++			case 12: return {NewRef(), std::get<RecordVal*>(var)};
++			case 13: return {NewRef(), std::get<VectorVal*>(var)};
++			case 14:
++				{
++				TypePtr tp = {NewRef{}, std::get<Type*>(var)};
++				return make_intrusive<TypeVal>(tp);
++				}
++			case 15: return {NewRef(), std::get<Val*>(var)};
++			default: return nullptr;
++			}
++
++		// std::variant<bro_int_t, bro_uint_t, double, StringVal*, AddrVal*, SubNetVal*,
++		//              File*, Func*, ListVal*, OpaqueVal*, PatternVal*, TableVal*,
++		//              RecordVal*, VectorVal*, Type*, Val*, Obj*, PortVal*> var;
++		}
+ 
+ 	case TYPE_TYPE:
+ 		{
+-		TypePtr tp = {NewRef{}, type_val};
++		TypePtr tp = {NewRef{}, std::get<Type*>(var)};
+ 		return make_intrusive<TypeVal>(tp);
+ 		}
+ 
+ 	case TYPE_FUNC:
+-		if ( func_val )
++		{
++		if ( Func* f = std::get<Func*>(var) )
+ 			{
+-			FuncPtr fv_ptr = {NewRef{}, func_val};
++			FuncPtr fv_ptr = {NewRef{}, f};
+ 			return make_intrusive<FuncVal>(fv_ptr);
+ 			}
++		}
+ 
+ 		return nullptr;
+ 
+ 	case TYPE_FILE:
+-		if ( file_val )
++		if ( File* f = std::get<File*>(var) )
+ 			{
+-			FilePtr fv_ptr = {NewRef{}, file_val};
++			FilePtr fv_ptr = {NewRef{}, f};
+ 			return make_intrusive<FileVal>(fv_ptr);
+ 			}
+ 
+ 		return nullptr;
+ 
+-	case TYPE_ADDR:		v = addr_val; break;
+-	case TYPE_SUBNET:	v = subnet_val; break;
+-	case TYPE_STRING:	v = string_val; break;
+-	case TYPE_LIST:		v = list_val; break;
+-	case TYPE_OPAQUE:	v = opaque_val; break;
+-	case TYPE_TABLE:	v = table_val; break;
+-	case TYPE_RECORD:	v = record_val; break;
+-	case TYPE_VECTOR:	v = vector_val; break;
+-	case TYPE_PATTERN:	v = re_val; break;
++	case TYPE_ADDR:		return {NewRef(), std::get<AddrVal*>(var)};
++	case TYPE_SUBNET:	return {NewRef(), std::get<SubNetVal*>(var)};
++	case TYPE_STRING:	return {NewRef(), std::get<StringVal*>(var)};
++	case TYPE_LIST:		return {NewRef(), std::get<ListVal*>(var)};
++	case TYPE_OPAQUE:	return {NewRef(), std::get<OpaqueVal*>(var)};
++	case TYPE_TABLE:	return {NewRef(), std::get<TableVal*>(var)};
++	case TYPE_RECORD:	return {NewRef(), std::get<RecordVal*>(var)};
++	case TYPE_VECTOR:	return {NewRef(), std::get<VectorVal*>(var)};
++	case TYPE_PATTERN:	return {NewRef(), std::get<PatternVal*>(var)};
+ 
+ 	case TYPE_ERROR:
+ 	case TYPE_TIMER:
+@@ -233,9 +269,6 @@ ValPtr ZVal::ToVal(const TypePtr& t) const
+ 		reporter->InternalError("bad ret type return tag");
+ 	}
+ 
+-	if ( v )
+-		return {NewRef{}, v};
+-
+ 	reporter->Error("value used but not set");
+ 	zval_error_status = true;
+ 
+diff --git a/src/ZVal.h b/src/ZVal.h
+index 4dacdd7bf..d4804feba 100644
+--- a/src/ZVal.h
++++ b/src/ZVal.h
+@@ -4,10 +4,9 @@
+ 
+ #pragma once
+ 
+-#include <unordered_set>
++#include <variant>
+ 
+-#include "zeek/Dict.h"
+-#include "zeek/Expr.h"
++#include "zeek/Type.h"
+ 
+ ZEEK_FORWARD_DECLARE_NAMESPACED(StringVal, zeek);
+ ZEEK_FORWARD_DECLARE_NAMESPACED(AddrVal, zeek);
+@@ -20,6 +19,7 @@ ZEEK_FORWARD_DECLARE_NAMESPACED(PatternVal, zeek);
+ ZEEK_FORWARD_DECLARE_NAMESPACED(TableVal, zeek);
+ ZEEK_FORWARD_DECLARE_NAMESPACED(RecordVal, zeek);
+ ZEEK_FORWARD_DECLARE_NAMESPACED(VectorVal, zeek);
++ZEEK_FORWARD_DECLARE_NAMESPACED(PortVal, zeek);
+ ZEEK_FORWARD_DECLARE_NAMESPACED(Type, zeek);
+ ZEEK_FORWARD_DECLARE_NAMESPACED(Val, zeek);
+ 
+@@ -36,9 +36,13 @@ namespace zeek {
+ // to the managed_val member, which both simplifies memory management
+ // and is also required for sharing of ZAM frame slots.
+ 
+-union ZVal {
+-	// Constructor for hand-populating the values.
+-	ZVal() { managed_val = nullptr; }
++class ZVal {
++
++public:
++
++	// Constructor for hand-populating the values. This causes the variant
++	// to have a uint stored in it.
++	ZVal() : var(0) {}
+ 
+ 	// Construct from a given higher-level script value with a given type.
+ 	ZVal(ValPtr v, const TypePtr& t);
+@@ -56,37 +60,9 @@ union ZVal {
+ 
+ 	friend void DeleteManagedType(ZVal& v);
+ 
+-	// Used for bool, int, enum.
+-	bro_int_t int_val;
+-
+-	// Used for count and port.
+-	bro_uint_t uint_val;
+-
+-	// Used for double, time, interval.
+-	double double_val;
+-
+-	// The types are all variants of Val, Type, or more fundamentally
+-	// Obj.  They are raw pointers rather than IntrusivePtr's because
+-	// unions can't contain the latter.  For memory management, we use
+-	// Ref/Unref.
+-	StringVal* string_val;
+-	AddrVal* addr_val;
+-	SubNetVal* subnet_val;
+-	File* file_val;
+-	Func* func_val;
+-	ListVal* list_val;
+-	OpaqueVal* opaque_val;
+-	PatternVal* re_val;
+-	TableVal* table_val;
+-	RecordVal* record_val;
+-	VectorVal* vector_val;
+-	Type* type_val;
+-
+-	// Used for "any" values.
+-	Val* any_val;
+-
+-	// Used for generic access to managed (derived-from-Obj) objects.
+-	Obj* managed_val;
++	std::variant<bro_int_t, bro_uint_t, double, StringVal*, AddrVal*, SubNetVal*,
++	             File*, Func*, ListVal*, OpaqueVal*, PatternVal*, TableVal*,
++	             RecordVal*, VectorVal*, Type*, Val*, Obj*, PortVal*> var;
+ 
+ 	// A class-wide status variable set to true when a run-time
+ 	// error associated with ZVal's occurs.  Static because often
+@@ -104,7 +80,8 @@ bool IsManagedType(const TypePtr& t);
+ // indeed holds such.
+ inline void DeleteManagedType(ZVal& v)
+ 	{
+-	Unref(v.managed_val);
++	// auto o = std::get<Obj*>(v);
++	// Unref(o);
+ 	}
+ 
+ // Deletes a possibly-managed value.

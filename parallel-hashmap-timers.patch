@@ -1,0 +1,214 @@
+diff --git a/src/PriorityQueue.h b/src/PriorityQueue.h
+index 665a83aa0..8e15dcd0b 100644
+--- a/src/PriorityQueue.h
++++ b/src/PriorityQueue.h
+@@ -5,8 +5,6 @@
+ #include <math.h>
+ #include <stdint.h>
+ 
+-class PriorityQueue;
+-
+ class PQ_Element {
+ public:
+ 	explicit PQ_Element(double t)	{ time = t; offset = -1; }
+@@ -25,6 +23,14 @@ protected:
+ 	int offset;
+ };
+ 
++class PQ_Comparer {
++public:
++	bool operator()(const PQ_Element* l, const PQ_Element* r) const noexcept
++		{
++		return l->Time() < r->Time();
++		}
++	};
++
+ class PriorityQueue {
+ public:
+ 	explicit PriorityQueue(int initial_size = 16);
+diff --git a/src/Timer.cc b/src/Timer.cc
+index dc0fb5e47..06c2360b9 100644
+--- a/src/Timer.cc
++++ b/src/Timer.cc
+@@ -11,6 +11,8 @@
+ #include "iosource/Manager.h"
+ #include "iosource/PktSrc.h"
+ 
++#include "3rdparty/parallel-hashmap/parallel_hashmap/btree.h"
++
+ // Names of timers in same order than in TimerType.
+ const char* TimerNames[] = {
+ 	"BackdoorTimer",
+@@ -62,10 +64,6 @@ unsigned int TimerMgr::current_timers[NUM_TIMER_TYPES];
+ 
+ TimerMgr::TimerMgr()
+ 	{
+-	t = 0.0;
+-	num_expired = 0;
+-	last_advance = last_timestamp = 0;
+-
+ 	if ( iosource_mgr )
+ 		iosource_mgr->Register(this, true);
+ 	}
+@@ -110,7 +108,7 @@ void TimerMgr::InitPostScript()
+ 
+ PQ_TimerMgr::PQ_TimerMgr() : TimerMgr()
+ 	{
+-	q = new PriorityQueue;
++	q = new phmap::btree_set<PQ_Element*, PQ_Comparer>();
+ 	}
+ 
+ PQ_TimerMgr::~PQ_TimerMgr()
+@@ -126,10 +124,13 @@ void PQ_TimerMgr::Add(Timer* timer)
+ 	// Add the timer even if it's already expired - that way, if
+ 	// multiple already-added timers are added, they'll still
+ 	// execute in sorted order.
+-	if ( ! q->Add(timer) )
+-		reporter->InternalError("out of memory");
+-
++	q->emplace(timer);
+ 	++current_timers[timer->Type()];
++
++	if ( q->size() > peak_size )
++		peak_size = q->size();
++
++	cumulative++;
+ 	}
+ 
+ void PQ_TimerMgr::Expire()
+@@ -147,24 +148,21 @@ void PQ_TimerMgr::Expire()
+ 
+ int PQ_TimerMgr::DoAdvance(double new_t, int max_expire)
+ 	{
+-	Timer* timer = Top();
++	// Remove the next element from the front of the set
++	Timer* timer = Remove();
++
+ 	for ( num_expired = 0; (num_expired < max_expire || max_expire == 0) &&
+ 		     timer && timer->Time() <= new_t; ++num_expired )
+ 		{
+ 		last_timestamp = timer->Time();
+ 		--current_timers[timer->Type()];
+ 
+-		// Remove it before dispatching, since the dispatch
+-		// can otherwise delete it, and then we won't know
+-		// whether we should delete it too.
+-		(void) Remove();
+-
+ 		DBG_LOG(DBG_TM, "Dispatching timer %s (%p)",
+ 		        timer_type_to_string(timer->Type()), timer);
+ 		timer->Dispatch(new_t, 0);
+ 		delete timer;
+ 
+-		timer = Top();
++		timer = Remove();
+ 		}
+ 
+ 	return num_expired;
+@@ -172,13 +170,37 @@ int PQ_TimerMgr::DoAdvance(double new_t, int max_expire)
+ 
+ void PQ_TimerMgr::Remove(Timer* timer)
+ 	{
+-	if ( ! q->Remove(timer) )
+-		reporter->InternalError("asked to remove a missing timer");
++	auto it = q->find(timer);
++	if ( it != q->end() )
++		q->erase(it);
+ 
+ 	--current_timers[timer->Type()];
+ 	delete timer;
+ 	}
+ 
++size_t PQ_TimerMgr::Size() const
++	{
++	return q->size();
++	}
++
++Timer* PQ_TimerMgr::Remove()
++	{
++	if ( q->empty() )
++		return nullptr;
++
++	Timer* t = (Timer*)*(q->begin());
++	q->erase(q->begin());
++	return t;
++	}
++
++Timer* PQ_TimerMgr::Top()
++	{
++	if ( q->empty() )
++		return nullptr;
++
++	return (Timer*)*(q->begin());
++	}
++
+ double PQ_TimerMgr::GetNextTimeout()
+ 	{
+ 	Timer* top = Top();
+diff --git a/src/Timer.h b/src/Timer.h
+index 5148248d2..1c5cc06ee 100644
+--- a/src/Timer.h
++++ b/src/Timer.h
+@@ -4,6 +4,7 @@
+ 
+ #include "PriorityQueue.h"
+ #include "iosource/IOSource.h"
++#include "3rdparty/parallel-hashmap/parallel_hashmap/phmap_fwd_decl.h"
+ 
+ #include <stdint.h>
+ 
+@@ -105,8 +106,8 @@ public:
+ 
+ 	double Time() const		{ return t ? t : 1; }	// 1 > 0
+ 
+-	virtual int Size() const = 0;
+-	virtual int PeakSize() const = 0;
++	virtual size_t Size() const = 0;
++	virtual size_t PeakSize() const = 0;
+ 	virtual uint64_t CumulativeNum() const = 0;
+ 
+ 	double LastTimestamp() const	{ return last_timestamp; }
+@@ -135,11 +136,11 @@ protected:
+ 	virtual int DoAdvance(double t, int max_expire) = 0;
+ 	virtual void Remove(Timer* timer) = 0;
+ 
+-	double t;
+-	double last_timestamp;
+-	double last_advance;
++	double t = 0.0;
++	double last_timestamp = 0.0;
++	double last_advance = 0.0;
+ 
+-	int num_expired;
++	int num_expired = 0;
+ 
+ 	static unsigned int current_timers[NUM_TIMER_TYPES];
+ };
+@@ -152,19 +153,21 @@ public:
+ 	void Add(Timer* timer) override;
+ 	void Expire() override;
+ 
+-	int Size() const override { return q->Size(); }
+-	int PeakSize() const override { return q->PeakSize(); }
+-	uint64_t CumulativeNum() const override { return q->CumulativeNum(); }
++	size_t Size() const override;
++	size_t PeakSize() const override { return peak_size; }
++	uint64_t CumulativeNum() const override { return cumulative; }
+ 	double GetNextTimeout() override;
+ 
+ protected:
+ 	int DoAdvance(double t, int max_expire) override;
+ 	void Remove(Timer* timer) override;
+ 
+-	Timer* Remove()			{ return (Timer*) q->Remove(); }
+-	Timer* Top()			{ return (Timer*) q->Top(); }
++	Timer* Remove();
++	Timer* Top();
+ 
+-	PriorityQueue* q;
++	phmap::btree_set<PQ_Element*, PQ_Comparer>* q;
++	size_t peak_size = 0;
++	uint64_t cumulative = 0;
+ };
+ 
+ extern TimerMgr* timer_mgr;

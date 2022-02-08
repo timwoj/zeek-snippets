@@ -1,0 +1,110 @@
+diff --git a/scripts/base/frameworks/files/main.zeek b/scripts/base/frameworks/files/main.zeek
+index 10cc81ba5..5294180af 100644
+--- a/scripts/base/frameworks/files/main.zeek
++++ b/scripts/base/frameworks/files/main.zeek
+@@ -332,7 +332,7 @@ redef record fa_file += {
+ };
+ 
+ # Store the callbacks for protocol analyzers that have files.
+-global registered_protocols: table[Analyzer::Tag] of ProtoRegistration = table();
++global registered_protocols: table[AllAnalyzers::Tag] of ProtoRegistration = table();
+ 
+ # Store the MIME type to analyzer mappings.
+ global mime_types: table[Files::Tag] of set[string];
+@@ -508,6 +508,8 @@ function describe(f: fa_file): string
+ 	return handler$describe(f);
+ 	}
+ 
++global get_file_handle: event(tag: Files::Tag, c: connection, is_orig: bool);
++
+ event get_file_handle(tag: Files::Tag, c: connection, is_orig: bool) &priority=5
+ 	{
+ 	if ( tag !in registered_protocols )
+diff --git a/src/EventHandler.h b/src/EventHandler.h
+index ed981ae7e..f47ff173d 100644
+--- a/src/EventHandler.h
++++ b/src/EventHandler.h
+@@ -20,7 +20,7 @@ class EventHandler
+ public:
+ 	explicit EventHandler(std::string name);
+ 
+-	const char* Name() { return name.data(); }
++	const char* Name() const { return name.data(); }
+ 
+ 	const FuncPtr& GetFunc() { return local; }
+ 
+diff --git a/src/Type.cc b/src/Type.cc
+index 80a6e9c67..6639f7ea6 100644
+--- a/src/Type.cc
++++ b/src/Type.cc
+@@ -1675,11 +1675,8 @@ void EnumType::Describe(ODesc* d) const
+ 	else
+ 		{
+ 		d->Add(type_name(t));
+-		if ( ! d->IsShort() )
+-			{
+-			d->SP();
+-			d->Add(GetName());
+-			}
++		d->SP();
++		d->Add(GetName());
+ 		}
+ 	}
+ 
+@@ -1896,11 +1893,43 @@ bool same_type(const Type& arg_t1, const Type& arg_t2, bool is_init, bool match_
+ 			return true;
+ 
+ 		case TYPE_ENUM:
++			{
++			auto et1 = static_cast<const EnumType*>(t1);
++			auto et2 = static_cast<const EnumType*>(t2);
++
++			const EnumType* big = et1;
++			const EnumType* small = et2;
++
++			if ( et2->Length() > et1->Length() )
++				{
++				big = et2;
++				small = et1;
++				}
++
++			auto big_names = big->Names();
++			auto small_names = small->Names();
++
++			if ( big->GetName() == "AllAnalyzers::Tag" &&
++			     (small->GetName() == "Analyzer::Tag" ||
++			      small->GetName() == "Files::Tag" ||
++			      small->GetName() == "PacketAnalyzer::Tag") )
++				{
++				return true;
++				}
++
++			for ( const auto& entry : small_names )
++				{
++				bro_int_t value = big->Lookup(zeek::detail::current_module, entry.first.c_str());
++				if ( value == -1)
++					return false;
++				}
++
+ 			// We should probably check to see whether all of the
+ 			// enumerations are present and in the same location.
+ 			// FIXME: Yes, but perhaps we should better return
+ 			// true per default?
+ 			return true;
++			}
+ 
+ 		case TYPE_OPAQUE:
+ 			{
+diff --git a/src/Type.h b/src/Type.h
+index e81ed9eec..e46ceda28 100644
+--- a/src/Type.h
++++ b/src/Type.h
+@@ -784,6 +784,8 @@ public:
+ 	// access it.
+ 	void AddNameInternal(const std::string& full_name, bro_int_t val);
+ 
++	size_t Length() const { return names.size(); }
++
+ protected:
+ 	void AddNameInternal(const std::string& module_name, const char* name, bro_int_t val,
+ 	                     bool is_export);

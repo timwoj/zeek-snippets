@@ -1,0 +1,389 @@
+diff --git a/scripts/base/packet-protocols/vlan/main.zeek b/scripts/base/packet-protocols/vlan/main.zeek
+index 78bff9398..90c063045 100644
+--- a/scripts/base/packet-protocols/vlan/main.zeek
++++ b/scripts/base/packet-protocols/vlan/main.zeek
+@@ -6,6 +6,6 @@ redef PacketAnalyzer::config_map += {
+    PacketAnalyzer::ConfigEntry($parent=PacketAnalyzer::ANALYZER_VLAN, $identifier=0x86DD, $analyzer=PacketAnalyzer::ANALYZER_IPV6),
+    PacketAnalyzer::ConfigEntry($parent=PacketAnalyzer::ANALYZER_VLAN, $identifier=0x0806, $analyzer=PacketAnalyzer::ANALYZER_ARP),
+    PacketAnalyzer::ConfigEntry($parent=PacketAnalyzer::ANALYZER_VLAN, $identifier=0x8035, $analyzer=PacketAnalyzer::ANALYZER_ARP),
+-   PacketAnalyzer::ConfigEntry($parent=PacketAnalyzer::ANALYZER_VLAN, $identifier=0x8100, $analyzer=PacketAnalyzer::ANALYZER_VLAN),
++#   PacketAnalyzer::ConfigEntry($parent=PacketAnalyzer::ANALYZER_VLAN, $identifier=0x8100, $analyzer=PacketAnalyzer::ANALYZER_VLAN),
+    PacketAnalyzer::ConfigEntry($parent=PacketAnalyzer::ANALYZER_VLAN, $identifier=0x8864, $analyzer=PacketAnalyzer::ANALYZER_PPPOE)
+ };
+diff --git a/src/packet_analysis/CMakeLists.txt b/src/packet_analysis/CMakeLists.txt
+index 88023b8fa..190425341 100644
+--- a/src/packet_analysis/CMakeLists.txt
++++ b/src/packet_analysis/CMakeLists.txt
+@@ -6,14 +6,12 @@ include_directories(BEFORE
+ )
+ 
+ add_subdirectory(protocol)
+-add_subdirectory(dispatchers)
+ 
+ set(llanalyzer_SRCS
+     Analyzer.cc
+     Manager.cc
+     Component.cc
+     Tag.cc
+-    Config.cc
+ )
+ 
+ bro_add_subdir_library(llanalyzer ${llanalyzer_SRCS})
+diff --git a/src/packet_analysis/Config.cc b/src/packet_analysis/Config.cc
+index 4fd644b35..60040ce38 100644
+--- a/src/packet_analysis/Config.cc
++++ b/src/packet_analysis/Config.cc
+@@ -82,6 +82,22 @@ void Config::AddMapping(const std::string& name, identifier_t identifier,
+ 		AddDispatcherConfig(name).AddMapping(identifier, analyzer_name);
+ 	else
+ 		dispatch_config->get().AddMapping(identifier, analyzer_name);
++
++	auto it2 = str_mappings.find(analyzer_name);
++	if ( it2 == str_mappings.end() )
++		str_mappings[analyzer_name] = std::vector<std::string>();
++
++	auto it = str_mappings.find(name);
++	if ( it != str_mappings.end() )
++		{
++		std::vector<std::string>& vect = str_mappings[analyzer_name];
++		for ( auto s : it->second )
++			vect.emplace_back(fmt("%s:%d", s.c_str(), identifier));
++		}
++	else
++		{
++		str_mappings[analyzer_name].push_back(fmt("%d", identifier));
++		}
+ 	}
+ 
+ } // namespace packet_analysis
+diff --git a/src/packet_analysis/Config.h b/src/packet_analysis/Config.h
+index f99526d31..214cd13cd 100644
+--- a/src/packet_analysis/Config.h
++++ b/src/packet_analysis/Config.h
+@@ -39,6 +39,7 @@ public:
+ 
+ private:
+ 	std::vector<DispatcherConfig> dispatchers;
++	std::map<std::string, std::vector<std::string>> str_mappings;
+ };
+ 
+ }
+diff --git a/src/packet_analysis/Manager.cc b/src/packet_analysis/Manager.cc
+index 8261c0345..947ee4346 100644
+--- a/src/packet_analysis/Manager.cc
++++ b/src/packet_analysis/Manager.cc
+@@ -2,14 +2,13 @@
+ 
+ #include "Manager.h"
+ 
++#include <algorithm>
+ #include <list>
+ #include <pcap.h>
+ 
+-#include "Config.h"
+ #include "NetVar.h"
+ #include "plugin/Manager.h"
+ #include "Analyzer.h"
+-#include "dispatchers/VectorDispatcher.h"
+ 
+ using namespace zeek::packet_analysis;
+ 
+@@ -32,7 +31,10 @@ void Manager::InitPostScript()
+ 	if ( mapping_val->Size() == 0 )
+ 		return;
+ 
+-	Config configuration;
++	using EntryMap = std::vector<std::tuple<std::string, std::string, std::string>>;
++	EntryMap entries;
++	std::map<std::string, std::string> str_mappings;
++
+ 	for (unsigned int i = 0; i < mapping_val->Size(); i++)
+ 		{
+ 		auto* rv = mapping_val->At(i)->AsRecordVal();
+@@ -40,29 +42,67 @@ void Manager::InitPostScript()
+ 		std::string parent_name = parent ? Lookup(parent->AsEnumVal())->Name() : "ROOT";
+ 		auto identifier = rv->GetField("identifier")->AsCount();
+ 		auto analyzer = rv->GetField("analyzer")->AsEnumVal();
++		std::string analyzer_name = Lookup(analyzer)->Name();
++
++		entries.push_back({parent_name, fmt("%lx", identifier), analyzer_name});
+ 
+-		configuration.AddMapping(parent_name, identifier, Lookup(analyzer)->Name());
++		// Check if already instantiated
++		if ( analyzers.count(analyzer_name) ==  0 )
++			{
++			// Check if analyzer exists
++			if ( AnalyzerPtr newAnalyzer = InstantiateAnalyzer(analyzer_name) )
++				analyzers.emplace(analyzer_name, newAnalyzer);
++			else
++				continue;
++			}
+ 		}
+ 
+-	// Instantiate objects for all analyzers
+-	for ( const auto& current_dispatcher_config : configuration.GetDispatchers() )
++	size_t pos = 0;
++	while ( pos != entries.size() )
+ 		{
+-		for ( const auto& current_mapping : current_dispatcher_config.GetMappings() )
++		auto parent = std::get<0>(entries[pos]);
++		auto identifier = std::get<1>(entries[pos]);
++		auto analyzer = std::get<2>(entries[pos]);
++
++		if ( analyzers.count(analyzer) ==  0 )
++			continue;
++
++		// There's an infinite loop here. This gets handled more gracefully during ProcessPacket().
++		if ( parent == analyzer )
+ 			{
+-			// Check if already instantiated
+-			if ( analyzers.count(current_mapping.second) != 0 )
+-				continue;
++			pos++;
++			continue;
++			}
+ 
+-			// Check if analyzer exists
+-			if ( AnalyzerPtr newAnalyzer = InstantiateAnalyzer(current_mapping.second) )
+-				analyzers.emplace(current_mapping.second, newAnalyzer);
++		AnalyzerPtr a = analyzers[analyzer];
++
++		if ( parent == "ROOT" )
++			{
++			id_map.insert({identifier, a});
++			pos++;
+ 			}
+-		}
++		else
++			{
++			EntryMap new_entries;
++			auto it = std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return std::get<2>(e) == parent; });
++			while ( it != entries.end() )
++				{
++				std::string new_id = identifier;
++				new_id.insert(0, ":");
++				new_id.insert(0, std::get<1>(*it));
++
++				new_entries.push_back({std::get<0>(*it), new_id, analyzer});
++				it = std::find_if(std::next(it), entries.end(), [&](const auto& e) { return std::get<2>(e) == parent; });
++				}
++
++			it = entries.begin();
++			std::advance(it, pos);
++			entries.erase(it);
+ 
+-	// Generate Dispatchers, starting at root
+-	root_dispatcher = GetDispatcher(configuration, "ROOT");
+-	if ( root_dispatcher == nullptr )
+-		reporter->InternalError("No dispatching configuration for ROOT of packet_analysis set.");
++			if ( ! new_entries.empty() )
++				entries.insert(entries.end(), new_entries.begin(), new_entries.end());
++			}
++		}
+ 
+ 	// Set up default analysis
+ 	auto it = analyzers.find("DefaultAnalyzer");
+@@ -70,12 +110,6 @@ void Manager::InitPostScript()
+ 		default_analyzer = it->second;
+ 	else
+ 		default_analyzer = InstantiateAnalyzer("DefaultAnalyzer");
+-
+-	default_dispatcher = nullptr;
+-	if ( default_analyzer != nullptr )
+-		default_dispatcher = GetDispatcher(configuration, "DefaultAnalyzer");
+-
+-	current_state = root_dispatcher;
+ 	}
+ 
+ void Manager::Done()
+@@ -90,13 +124,6 @@ void Manager::DumpDebug()
+ 		{
+ 		DBG_LOG(DBG_PACKET_ANALYSIS, "    %s (%s)", current->Name().c_str(), IsEnabled(current->Tag()) ? "enabled" : "disabled");
+ 		}
+-
+-	DBG_LOG(DBG_PACKET_ANALYSIS, "ProtocolAnalyzerSet FSM:");
+-	for ( const auto& current : dispatchers )
+-		{
+-		DBG_LOG(DBG_PACKET_ANALYSIS, "  Dispatcher (%p): %s", current.second.get(), current.first.c_str());
+-		current.second->DumpDebug();
+-		}
+ #endif
+ 	}
+ 
+@@ -231,36 +258,41 @@ void Manager::ProcessPacket(Packet* packet)
+ 	DBG_LOG(DBG_PACKET_ANALYSIS, "Analyzing packet %ld, ts=%.3f...", ++counter, packet->time);
+ #endif
+ 
++	std::string current_chain = fmt("%x", packet->link_type);
++	identifier_t next_layer_id = packet->link_type;
++	identifier_t last_layer_id = packet->link_type;
++
+ 	// Dispatch and analyze layers
+ 	AnalyzerResult result = AnalyzerResult::Continue;
+-	identifier_t next_layer_id = packet->link_type;
+ 	do
+ 		{
+-		auto current_analyzer = Dispatch(next_layer_id);
++		if ( next_layer_id != last_layer_id )
++			current_chain.append(fmt(":%x", next_layer_id));
+ 
+-		// Analyzer not found
+-		if ( current_analyzer == nullptr )
++		auto it = id_map.find(current_chain);
++		if ( it != id_map.end() )
++			current_state = it->second;
++		else
+ 			{
+-			DBG_LOG(DBG_PACKET_ANALYSIS, "Could not find analyzer for identifier %#x", next_layer_id);
+ 			packet->Weird("no_suitable_analyzer_found");
+-			break;
++			return;
+ 			}
+ 
+ 		// Analyze this layer and get identifier of next layer protocol
+-		std::tie(result, next_layer_id) = current_analyzer->Analyze(packet);
++		std::tie(result, next_layer_id) = current_state->Analyze(packet);
+ 
+ #ifdef DEBUG
+ 		switch ( result )
+ 			{
+ 			case AnalyzerResult::Continue:
+ 				DBG_LOG(DBG_PACKET_ANALYSIS, "Analysis in %s succeeded, next layer identifier is %#x.",
+-				        current_analyzer->GetAnalyzerName(), next_layer_id);
++				        current_state->GetAnalyzerName(), next_layer_id);
+ 				break;
+ 			case AnalyzerResult::Terminate:
+ 				DBG_LOG(DBG_PACKET_ANALYSIS, "Done, last found layer identifier was %#x.", next_layer_id);
+ 				break;
+ 			case AnalyzerResult::Failed:
+-				DBG_LOG(DBG_PACKET_ANALYSIS, "Analysis failed in %s", current_analyzer->GetAnalyzerName());
++				DBG_LOG(DBG_PACKET_ANALYSIS, "Analysis failed in %s", current_state->GetAnalyzerName());
+ 			}
+ #endif
+ 
+@@ -270,7 +302,7 @@ void Manager::ProcessPacket(Packet* packet)
+ 		CustomEncapsulationSkip(packet);
+ 
+ 	// Processing finished, reset analyzer set state for next packet
+-	Reset();
++	current_state = nullptr;
+ 	}
+ 
+ void Manager::CustomEncapsulationSkip(Packet* packet)
+@@ -308,71 +340,7 @@ void Manager::CustomEncapsulationSkip(Packet* packet)
+ 		}
+ 	}
+ 
+-AnalyzerPtr Manager::Dispatch(identifier_t identifier)
+-	{
+-	// Because leaf nodes (aka no more dispatching) can still have an existing analyzer that returns more identifiers,
+-	// current_state needs to be checked to be not null. In this case there would have been an analyzer dispatched
+-	// in the last layer, but no dispatcher for it (end of FSM)
+-	ValuePtr result = nullptr;
+-	if ( current_state )
+-		result = current_state->Lookup(identifier);
+-
+-	if ( result == nullptr )
+-		{
+-		if ( current_state != default_dispatcher )
+-			{
+-			// Switch to default analysis once
+-			current_state = default_dispatcher;
+-			return default_analyzer;
+-			}
+-		return nullptr;
+-		}
+-	else
+-		{
+-		current_state = result->dispatcher;
+-		return result->analyzer;
+-		}
+-	}
+-
+ void Manager::Reset()
+ 	{
+-	current_state = root_dispatcher;
+-	}
+-
+-DispatcherPtr Manager::GetDispatcher(Config& configuration, const std::string& dispatcher_name)
+-	{
+-	// Is it already created?
+-	if ( dispatchers.count(dispatcher_name) != 0 )
+-		return dispatchers[dispatcher_name];
+-
+-	// Create new dispatcher from config
+-	std::optional<std::reference_wrapper<DispatcherConfig>> dispatcher_config =
+-		configuration.GetDispatcherConfig(dispatcher_name);
+-
+-	if ( ! dispatcher_config )
+-		// No such dispatcher found, this is therefore implicitly a leaf
+-		return nullptr;
+-
+-	const auto& mappings = dispatcher_config->get().GetMappings();
+-
+-	DispatcherPtr dispatcher = std::make_shared<VectorDispatcher>();
+-	dispatchers.emplace(dispatcher_name, dispatcher);
+-
+-	for ( const auto& current_mapping : mappings )
+-		{
+-		// No analyzer with this name. Report warning and ignore.
+-		if ( analyzers.count(current_mapping.second) == 0 )
+-			{
+-			reporter->InternalWarning("No analyzer %s found for dispatching identifier %#x of %s, ignoring.",
+-			                          current_mapping.second.c_str(),
+-			                          current_mapping.first,
+-			                          dispatcher_name.c_str());
+-			continue;
+-			}
+-
+-		dispatcher->Register(current_mapping.first, analyzers.at(current_mapping.second),
+-		                     GetDispatcher(configuration, current_mapping.second));
+-		}
+-
+-	return dispatcher;
++	current_state = nullptr;
+ 	}
+diff --git a/src/packet_analysis/Manager.h b/src/packet_analysis/Manager.h
+index 7e6c767c7..8d99c6456 100644
+--- a/src/packet_analysis/Manager.h
++++ b/src/packet_analysis/Manager.h
+@@ -5,7 +5,6 @@
+ #include <queue>
+ #include <vector>
+ 
+-#include "Config.h"
+ #include "Tag.h"
+ #include "Component.h"
+ #include "plugin/ComponentManager.h"
+@@ -16,9 +15,7 @@
+ namespace zeek::packet_analysis {
+ 
+ class Analyzer;
+-class Dispatcher;
+ using AnalyzerPtr = std::shared_ptr<Analyzer>;
+-using DispatcherPtr = std::shared_ptr<Dispatcher>;
+ 
+ class Manager : public plugin::ComponentManager<Tag, Component> {
+ public:
+@@ -159,18 +156,13 @@ private:
+ 	 */
+ 	void CustomEncapsulationSkip(Packet* packet);
+ 
+-	AnalyzerPtr Dispatch(identifier_t identifier);
+-
+ 	void Reset();
+ 
+-	DispatcherPtr GetDispatcher(Config& configuration, const std::string& dispatcher_name);
+-
+ 	std::map<std::string, AnalyzerPtr> analyzers;
+-	std::map<std::string, DispatcherPtr> dispatchers;
+-	DispatcherPtr root_dispatcher = nullptr;
+-	DispatcherPtr default_dispatcher = nullptr;
+-	DispatcherPtr current_state = nullptr;
++	AnalyzerPtr current_state = nullptr;
+ 	AnalyzerPtr default_analyzer = nullptr;
++
++	std::map<std::string, AnalyzerPtr> id_map;
+ };
+ 
+ }

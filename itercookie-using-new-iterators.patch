@@ -1,0 +1,450 @@
+diff --git a/src/Dict.cc b/src/Dict.cc
+index 737ebc35c..24cdbd343 100644
+--- a/src/Dict.cc
++++ b/src/Dict.cc
+@@ -27,51 +27,84 @@ namespace zeek {
+ 
+ class IterCookie {
+ public:
+-	IterCookie(Dictionary* d) : d(d) {}
++	IterCookie(Dictionary* d) : d(d)
++		{
++		}
+ 
+-	bool robust = false;
+ 	Dictionary* d = nullptr;
+-
+-	// Index for the next valid entry. -1 is the default, meaning we haven't started
+-	// iterating yet.
+-	int next = -1; //index for next valid entry. -1 is default not started yet.
+-
+-	// Tracks the new entries inserted while iterating. Only used for robust cookies.
+-	std::vector<detail::DictEntry>* inserted = nullptr;
+-
+-	// Tracks the entries already visited but were moved across the next iteration
+-	// point due to an insertion. Only used for robust cookies.
+-	std::vector<detail::DictEntry>* visited = nullptr;
++	DictIterator* iter = nullptr;
++	RobustDictIterator* robust_iter = nullptr;
++	bool robust = false;
+ 
+ 	void MakeRobust()
+ 		{
+ 		// IterCookies can't be made robust after iteration has started.
+-		ASSERT(next < 0);
+-		ASSERT(d && d->cookies);
++		ASSERT(iter && *iter == d->begin());
++		ASSERT(d && d->iterators);
+ 
+ 		robust = true;
+-		inserted = new std::vector<detail::DictEntry>();
+-		visited = new std::vector<detail::DictEntry>();
+-		d->cookies->push_back(this);
+ 		}
+ 
+ 	void AssertValid() const
+ 		{
+-		ASSERT(d && -1 <= next && next <= d->Capacity());
+-		ASSERT(( ! robust && ! inserted && ! visited ) || ( robust && inserted && visited ));
++		// TODO
++		// ASSERT(d && -1 <= next && next <= d->Capacity());
++		// ASSERT(( ! robust && ! inserted && ! visited ) || ( robust && inserted && visited ));
+ 		}
+ 
+ 	~IterCookie()
+ 		{
+ 		ASSERT_VALID(this);
+-		if( robust )
++		}
++
++	void Advance()
++		{
++		if ( ! robust )
++			{
++			if ( ! iter )
++				iter = new DictIterator(d->begin());
++			else
++				++iter;
++			}
++		else
+ 			{
+-			d->cookies->erase(std::remove(d->cookies->begin(), d->cookies->end(), this), d->cookies->end());
+-			delete inserted;
+-			delete visited;
++			if ( iter )
++				{
++				delete iter;
++				iter = nullptr;
++				}
++
++			if ( robust_iter )
++				robust_iter = new RobustDictIterator(d->begin_robust());
++			else
++				++robust_iter;
+ 			}
+ 		}
+-	};
++
++	detail::HashKey* GetKey()
++		{
++		if ( robust )
++			return new detail::HashKey((**robust_iter).GetKey(), (**robust_iter).key_size, (**robust_iter).hash);
++
++		return new detail::HashKey((**iter).GetKey(), (**iter).key_size, (**iter).hash);
++		}
++
++	void* GetValue()
++		{
++		if ( robust )
++			return (**robust_iter).value;
++
++		return (**iter).value;
++		}
++
++	bool AtEnd()
++		{
++		if ( robust )
++			return *robust_iter == d->end_robust();
++
++		return *iter == d->end();
++		}
++};
+ 
+ // namespace detail
+ 
+@@ -806,11 +839,6 @@ void Dictionary::Clear()
+ 		delete order;
+ 		order = nullptr;
+ 		}
+-	if ( cookies )
+-		{
+-		delete cookies;
+-		cookies = nullptr;
+-		}
+ 	if ( iterators )
+ 		{
+ 		delete iterators;
+@@ -949,7 +977,7 @@ void* Dictionary::Insert(void* key, int key_size, detail::hash_t hash, void* val
+ 	ASSERT_VALID(this);
+ 
+ 	// Allow insertions only if there's no active non-robust iterations.
+-	ASSERT(num_iterators == 0 || (cookies && cookies->size() == num_iterators) || (iterators && iterators->size() == num_iterators));
++	ASSERT(num_iterators == 0 || (iterators && iterators->size() == num_iterators));
+ 
+ 	// Initialize the table if it hasn't been done yet. This saves memory storing a bunch
+ 	// of empty dicts.
+@@ -975,17 +1003,6 @@ void* Dictionary::Insert(void* key, int key_size, detail::hash_t hash, void* val
+ 			it->value = val;
+ 			}
+ 
+-		if ( cookies && ! cookies->empty() )
+-			//need to set new v for cookies too.
+-			for ( auto c: *cookies )
+-				{
+-				ASSERT_VALID(c);
+-				//ASSERT(false);
+-				auto it = std::find(c->inserted->begin(), c->inserted->end(), table[position]);
+-				if ( it != c->inserted->end() )
+-					it->value = val;
+-				}
+-
+ 		if ( iterators && ! iterators->empty() )
+ 			//need to set new v for iterators too.
+ 			for ( auto c: *iterators )
+@@ -1036,9 +1053,6 @@ void Dictionary::InsertRelocateAndAdjust(detail::DictEntry& entry, int insert_po
+ 		remap_end = last_affected_position; //adjust to j on the conservative side.
+ 		}
+ 
+-	if ( cookies && ! cookies->empty() )
+-		for ( auto c: *cookies )
+-			AdjustOnInsert(c, entry, insert_position, last_affected_position);
+ 	if ( iterators && ! iterators->empty() )
+ 		for ( auto c: *iterators )
+ 			AdjustOnInsert(c, entry, insert_position, last_affected_position);
+@@ -1079,20 +1093,6 @@ void Dictionary::InsertAndRelocate(detail::DictEntry& entry, int insert_position
+ 	}
+ 
+ /// Adjust Cookies on Insert.
+-void Dictionary::AdjustOnInsert(IterCookie* c, const detail::DictEntry& entry, int insert_position, int last_affected_position)
+-	{
+-	ASSERT(c);
+-	ASSERT_VALID(c);
+-	if ( insert_position < c->next )
+-		c->inserted->push_back(entry);
+-	if ( insert_position < c->next && c->next <= last_affected_position )
+-		{
+-		int k = TailOfClusterByPosition(c->next);
+-		ASSERT(k >= 0 && k < Capacity());
+-		c->visited->push_back(table[k]);
+-		}
+-	}
+-
+ void Dictionary::AdjustOnInsert(RobustDictIterator* c, const detail::DictEntry& entry, int insert_position, int last_affected_position)
+ 	{
+ 	if ( insert_position < c->next )
+@@ -1132,7 +1132,7 @@ void Dictionary::SizeUp()
+ void* Dictionary::Remove(const void* key, int key_size, detail::hash_t hash, bool dont_delete)
+ 	{//cookie adjustment: maintain inserts here. maintain next in lower level version.
+ 	ASSERT_VALID(this);
+-	ASSERT(num_iterators == 0 || (cookies && cookies->size() == num_iterators) || (iterators && iterators->size() == num_iterators)); //only robust iterators exist.
++	ASSERT(num_iterators == 0 ||  (iterators && iterators->size() == num_iterators)); //only robust iterators exist.
+ 	ASSERT(! dont_delete); //this is a poorly designed flag. if on, the internal has nowhere to return and memory is lost.
+ 
+ 	int position = LookupIndex(key, key_size, hash);
+@@ -1163,10 +1163,6 @@ detail::DictEntry Dictionary::RemoveRelocateAndAdjust(int position)
+ 		ASSERT(! table[k].Empty());
+ #endif//DEBUG
+ 
+-	if ( cookies && ! cookies->empty() )
+-		for ( auto c: *cookies )
+-			AdjustOnRemove(c, entry, position, last_affected_position);
+-
+ 	if ( iterators && ! iterators->empty() )
+ 		for ( auto c: *iterators )
+ 			AdjustOnRemove(c, entry, position, last_affected_position);
+@@ -1199,23 +1195,6 @@ detail::DictEntry Dictionary::RemoveAndRelocate(int position, int* last_affected
+ 	return entry;
+ 	}
+ 
+-void Dictionary::AdjustOnRemove(IterCookie* c, const detail::DictEntry& entry, int position, int last_affected_position)
+-	{
+-	ASSERT_VALID(c);
+-	c->inserted->erase(std::remove(c->inserted->begin(), c->inserted->end(), entry), c->inserted->end());
+-	if ( position < c->next && c->next <= last_affected_position )
+-		{
+-		int moved = HeadOfClusterByPosition(c->next-1);
+-		if ( moved < position )
+-			moved = position;
+-		c->inserted->push_back(table[moved]);
+-		}
+-
+-	//if not already the end of the dictionary, adjust next to a valid one.
+-	if ( c->next < Capacity() && table[c->next].Empty() )
+-		c->next = Next(c->next);
+-	}
+-
+ void Dictionary::AdjustOnRemove(RobustDictIterator* c, const detail::DictEntry& entry, int position, int last_affected_position)
+ 	{
+ 	c->inserted->erase(std::remove(c->inserted->begin(), c->inserted->end(), entry), c->inserted->end());
+@@ -1262,7 +1241,7 @@ bool Dictionary::Remap(int position, int* new_position)
+ 	{
+ 	ASSERT_VALID(this);
+ 	///Remap changes item positions by remove() and insert(). to avoid excessive operation. avoid it when safe iteration is in progress.
+-	ASSERT( ( ! cookies || cookies->empty() ) && ( ! iterators || iterators->empty() ) );
++	ASSERT( ! iterators || iterators->empty() );
+ 	int current = BucketByPosition(position);//current bucket
+ 	int expected = BucketByHash(table[position].hash, log2_buckets); //expected bucket in new table.
+ 	//equal because 1: it's a new item, 2: it's an old item, but new bucket is the same as old. 50% of old items act this way due to fibhash.
+@@ -1298,9 +1277,7 @@ void* Dictionary::NthEntry(int n, const void*& key, int& key_size) const
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+ void Dictionary::MakeRobustCookie(IterCookie* cookie)
+-	{ //make sure c->next >= 0.
+-	if ( ! cookies )
+-		cookies = new std::vector<IterCookie*>;
++	{
+ 	cookie->MakeRobust();
+ 	ASSERT_VALID(cookie);
+ 	}
+@@ -1326,75 +1303,21 @@ void* Dictionary::NextEntryNonConst(detail::HashKey*& h, IterCookie*& c, bool re
+ 	// a large list when deleting an entry.
+ 	ASSERT(c);
+ 	ASSERT_VALID(c);
+-	if ( ! table )
+-		{
+-		if ( num_iterators > 0 )
+-			num_iterators--;
+-		delete c;
+-		c = nullptr;
+-		return nullptr; //end of iteration.
+-		}
+-
+-	if ( c->inserted && ! c->inserted->empty() )
+-		{
+-		// Return the last one. Order doesn't matter,
+-		// and removing from the tail is cheaper.
+-		detail::DictEntry e = c->inserted->back();
+-		if ( return_hash )
+-			h = new detail::HashKey(e.GetKey(), e.key_size, e.hash);
+-		void* v = e.value;
+-		c->inserted->pop_back();
+-		return v;
+-		}
+ 
+-	if ( c->next < 0 )
+-		c->next = Next(-1);
++	// Advance the iterator
++	c->Advance();
+ 
+-	// if resize happens during iteration. before sizeup, c->next points to Capacity(),
+-	// but now Capacity() doubles up and c->next doesn't point to the end anymore.
+-	// this is fine because c->next may be filled now.
+-	// however, c->next can also be empty.
+-	// before sizeup, we use c->next >= Capacity() to indicate the end of the iteration.
+-	// now this guard is invalid, we may face c->next is valid but empty now.F
+-	//fix it here.
+-	int capacity = Capacity();
+-	if ( c->next < capacity && table[c->next].Empty() )
++	// Check whether we're at the end of the iteration.
++	if ( c->AtEnd() )
+ 		{
+-		ASSERT(false); //stop to check the condition here. why it's happening.
+-		c->next = Next(c->next);
+-		}
+-
+-	//filter out visited keys.
+-	if ( c->visited && ! c->visited->empty() )
+-		//filter out visited entries.
+-		while ( c->next < capacity )
+-			{
+-			ASSERT(! table[c->next].Empty());
+-			auto it = std::find(c->visited->begin(), c->visited->end(), table[c->next]);
+-			if ( it == c->visited->end() )
+-				break;
+-			c->visited->erase(it);
+-			c->next = Next(c->next);
+-			}
+-
+-	if ( c->next >= capacity )
+-		{//end.
+-		if ( num_iterators > 0 )
+-			num_iterators--;
+ 		delete c;
+-		c = nullptr;
+-		return nullptr; //end of iteration.
++		return nullptr;
+ 		}
+ 
+-	ASSERT(! table[c->next].Empty());
+-	void* v = table[c->next].value;
+ 	if ( return_hash )
+-		h = new detail::HashKey(table[c->next].GetKey(), table[c->next].key_size, table[c->next].hash);
++		h = c->GetKey();
+ 
+-	//prepare for next time.
+-	c->next = Next(c->next);
+-	ASSERT_VALID(c);
+-	return v;
++	return c->GetValue();
+ 	}
+ 
+ IterCookie* Dictionary::InitForIteration() const
+@@ -1422,6 +1345,7 @@ void Dictionary::StopIteration(IterCookie* cookie) const
+ DictIterator::DictIterator(const Dictionary* d, detail::DictEntry* begin, detail::DictEntry* end)
+ 	: curr(begin), end(end)
+ 	{
++	printf("dict const\n");
+ 	// Make sure that we're starting on a non-empty element.
+ 	while ( curr != end && curr->Empty() )
+ 		++curr;
+@@ -1433,6 +1357,23 @@ DictIterator::DictIterator(const Dictionary* d, detail::DictEntry* begin, detail
+ 	dict->num_iterators++;
+ 	}
+ 
++DictIterator::DictIterator(const DictIterator& other)
++	{
++	printf("dict copy\n");
++	dict = other.dict;
++	curr = other.curr;
++	end = other.end;
++	}
++
++DictIterator::DictIterator(DictIterator&& other)
++	{
++	printf("dict move\n");
++	// These are all pointers, no real reason to move them.
++	dict = other.dict;
++	curr = other.curr;
++	end = other.end;
++	}
++
+ DictIterator::~DictIterator()
+ 	{
+ 	if ( dict->num_iterators > 0 )
+@@ -1531,8 +1472,11 @@ detail::DictEntry Dictionary::GetNextRobustIteration(RobustDictIterator* iter)
+ 	return e;
+ 	}
+ 
++
++
+ RobustDictIterator::RobustDictIterator(Dictionary* d, int begin) : curr(nullptr), end(nullptr), dict(d)
+ 	{
++	printf("robust const\n");
+ 	// Don't do any of this stuff for end iterators.
+ 	if ( begin != d->Capacity() )
+ 		{
+@@ -1545,6 +1489,28 @@ RobustDictIterator::RobustDictIterator(Dictionary* d, int begin) : curr(nullptr)
+ 		}
+ 	}
+ 
++RobustDictIterator::RobustDictIterator(const RobustDictIterator& other) : curr(other.curr), end(other.end)
++	{
++	printf("robust copy\n");
++	inserted = other.inserted;
++	visited = other.inserted;
++	dict = other.dict;
++	next = other.next;
++	}
++
++RobustDictIterator::RobustDictIterator(RobustDictIterator&& other) : curr(other.curr), end(other.end)
++	{
++	printf("robust move\n");
++	inserted = other.inserted;
++	visited = other.inserted;
++	dict = other.dict;
++	next = other.next;
++
++	dict->iterators->erase(std::remove(dict->iterators->begin(), dict->iterators->end(), &other),
++	                       dict->iterators->end());
++	dict->iterators->push_back(this);
++	}
++
+ RobustDictIterator::~RobustDictIterator()
+ 	{
+ 	Complete();
+diff --git a/src/Dict.h b/src/Dict.h
+index ddd9a049d..410e03886 100644
+--- a/src/Dict.h
++++ b/src/Dict.h
+@@ -152,6 +152,8 @@ public:
+ 	using iterator_category = std::bidirectional_iterator_tag;
+ 
+ 	DictIterator(const Dictionary* d, detail::DictEntry* begin, detail::DictEntry* end);
++	DictIterator(const DictIterator& other);
++	DictIterator(DictIterator&& other);
+ 	~DictIterator();
+ 
+ 	reference operator*() { return *curr; }
+@@ -179,6 +181,8 @@ public:
+ 	using iterator_category = std::bidirectional_iterator_tag;
+ 
+ 	RobustDictIterator(Dictionary* d, int begin);
++	RobustDictIterator(const RobustDictIterator& other);
++	RobustDictIterator(RobustDictIterator&& other);
+ 	~RobustDictIterator();
+ 	void Complete();
+ 
+@@ -413,7 +417,6 @@ private:
+ 	void InsertAndRelocate(detail::DictEntry& entry, int insert_position, int* last_affected_position = nullptr);
+ 
+ 	/// Adjust Cookies on Insert.
+-	void AdjustOnInsert(IterCookie* c, const detail::DictEntry& entry, int insert_position, int last_affected_position);
+ 	void AdjustOnInsert(RobustDictIterator* c, const detail::DictEntry& entry, int insert_position, int last_affected_position);
+ 
+ 	///Remove, Relocate & Adjust cookies.
+@@ -423,7 +426,6 @@ private:
+ 	detail::DictEntry RemoveAndRelocate(int position, int* last_affected_position = nullptr);
+ 
+ 	///Adjust safe cookies after Removal of entry at position.
+-	void AdjustOnRemove(IterCookie* c, const detail::DictEntry& entry, int position, int last_affected_position);
+ 	void AdjustOnRemove(RobustDictIterator* c, const detail::DictEntry& entry, int position, int last_affected_position);
+ 
+ 	bool Remapping() const { return remap_end >= 0;} //remap in reverse order.
+@@ -463,7 +465,6 @@ private:
+ 	uint64_t cum_entries = 0;
+ 	dict_delete_func delete_func = nullptr;
+ 	detail::DictEntry* table = nullptr;
+-	std::vector<IterCookie*>* cookies = nullptr;
+ 	std::vector<RobustDictIterator*>* iterators = nullptr;
+ 
+ 	// Order means the order of insertion. means no deletion until exit. will be inefficient.

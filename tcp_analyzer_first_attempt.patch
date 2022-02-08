@@ -1,0 +1,1470 @@
+diff --git a/src/analyzer/protocol/tcp/TCP.cc b/src/analyzer/protocol/tcp/TCP.cc
+index ec39826fe..05184e229 100644
+--- a/src/analyzer/protocol/tcp/TCP.cc
++++ b/src/analyzer/protocol/tcp/TCP.cc
+@@ -36,10 +36,9 @@ namespace zeek::analyzer::tcp {
+ #define TH_CWR  0x80
+ #endif
+ 
+-#define TOO_LARGE_SEQ_DELTA 1048576
+-
+-static const int ORIG = 1;
+-static const int RESP = 2;
++constexpr int32_t TOO_LARGE_SEQ_DELTA = 1048576;
++constexpr int ORIG = 1;
++constexpr int RESP = 2;
+ 
+ static RecordVal* build_syn_packet_val(bool is_orig, const IP_Hdr* ip,
+                                              const struct tcphdr* tcp)
+@@ -1258,16 +1257,6 @@ void TCP_Analyzer::DeliverPacket(int len, const u_char* data, bool is_orig,
+ 		ForwardPacket(len, data, is_orig, rel_data_seq, ip, caplen);
+ 	}
+ 
+-void TCP_Analyzer::DeliverStream(int len, const u_char* data, bool orig)
+-	{
+-	Analyzer::DeliverStream(len, data, orig);
+-	}
+-
+-void TCP_Analyzer::Undelivered(uint64_t seq, int len, bool is_orig)
+-	{
+-	Analyzer::Undelivered(seq, len, orig);
+-	}
+-
+ void TCP_Analyzer::FlipRoles()
+ 	{
+ 	Analyzer::FlipRoles();
+diff --git a/src/analyzer/protocol/tcp/TCP.h b/src/analyzer/protocol/tcp/TCP.h
+index ece776d71..c42b04a8a 100644
+--- a/src/analyzer/protocol/tcp/TCP.h
++++ b/src/analyzer/protocol/tcp/TCP.h
+@@ -85,8 +85,6 @@ protected:
+ 	void Done() override;
+ 	void DeliverPacket(int len, const u_char* data, bool orig, uint64_t seq,
+ 	                   const IP_Hdr* ip, int caplen) override;
+-	void DeliverStream(int len, const u_char* data, bool orig) override;
+-	void Undelivered(uint64_t seq, int len, bool orig) override;
+ 	void FlipRoles() override;
+ 	bool IsReuse(double t, const u_char* pkt) override;
+ 
+diff --git a/src/analyzer/protocol/tcp/TCP_Endpoint.cc b/src/analyzer/protocol/tcp/TCP_Endpoint.cc
+index e6bb9f4e1..465d2983f 100644
+--- a/src/analyzer/protocol/tcp/TCP_Endpoint.cc
++++ b/src/analyzer/protocol/tcp/TCP_Endpoint.cc
+@@ -18,7 +18,7 @@
+ 
+ namespace zeek::analyzer::tcp {
+ 
+-TCP_Endpoint::TCP_Endpoint(TCP_Analyzer* arg_analyzer, bool arg_is_orig)
++TCP_Endpoint::TCP_Endpoint(Analyzer* arg_analyzer, bool arg_is_orig)
+ 	{
+ 	contents_processor = nullptr;
+ 	prev_state = state = TCP_ENDPOINT_INACTIVE;
+@@ -61,6 +61,11 @@ void TCP_Endpoint::Done()
+ 		contents_processor->Done();
+ 	}
+ 
++TCP_Analyzer* TCP_Endpoint::TCP()
++	{
++	return static_cast<TCP_Analyzer*>(tcp_analyzer);
++	}
++
+ void TCP_Endpoint::SetPeer(TCP_Endpoint* p)
+ 	{
+ 	peer = p;
+diff --git a/src/analyzer/protocol/tcp/TCP_Endpoint.h b/src/analyzer/protocol/tcp/TCP_Endpoint.h
+index 0a2a86769..c57cbbba2 100644
+--- a/src/analyzer/protocol/tcp/TCP_Endpoint.h
++++ b/src/analyzer/protocol/tcp/TCP_Endpoint.h
+@@ -29,12 +29,12 @@ enum EndpointState {
+ // One endpoint of a TCP connection.
+ class TCP_Endpoint {
+ public:
+-	TCP_Endpoint(TCP_Analyzer* analyzer, bool is_orig);
++	TCP_Endpoint(Analyzer* analyzer, bool is_orig);
+ 	~TCP_Endpoint();
+ 
+ 	void Done();
+ 
+-	TCP_Analyzer* TCP()	{ return tcp_analyzer; }
++	TCP_Analyzer* TCP();
+ 
+ 	void SetPeer(TCP_Endpoint* p);
+ 
+@@ -212,7 +212,7 @@ public:
+ 	EndpointState state, prev_state;
+ 	TCP_Endpoint* peer;
+ 	TCP_Reassembler* contents_processor;
+-	TCP_Analyzer* tcp_analyzer;
++	Analyzer* tcp_analyzer;
+ 	FilePtr contents_file;
+ 
+ 	double start_time, last_time;
+diff --git a/src/packet_analysis/protocol/tcp/CMakeLists.txt b/src/packet_analysis/protocol/tcp/CMakeLists.txt
+index c42cca2b2..b943b2b6e 100644
+--- a/src/packet_analysis/protocol/tcp/CMakeLists.txt
++++ b/src/packet_analysis/protocol/tcp/CMakeLists.txt
+@@ -4,5 +4,5 @@ include(ZeekPlugin)
+ include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+ 
+ zeek_plugin_begin(PacketAnalyzer TCP_PKT)
+-zeek_plugin_cc(TCP.cc Plugin.cc)
++zeek_plugin_cc(TCP.cc TCPAnalyzerAdapter.cc Plugin.cc)
+ zeek_plugin_end()
+diff --git a/src/packet_analysis/protocol/tcp/TCP.cc b/src/packet_analysis/protocol/tcp/TCP.cc
+index 93c9f6012..1ea1829b7 100644
+--- a/src/packet_analysis/protocol/tcp/TCP.cc
++++ b/src/packet_analysis/protocol/tcp/TCP.cc
+@@ -2,12 +2,44 @@
+ 
+ #include "zeek/packet_analysis/protocol/tcp/TCP.h"
+ #include "zeek/RunState.h"
++#include "zeek/Conn.h"
++#include "zeek/Val.h"
++#include "zeek/net_util.h"
++#include "zeek/IntrusivePtr.h"
++#include "zeek/packet_analysis/protocol/tcp/TCPAnalyzerAdapter.h"
++
++#include "zeek/analyzer/protocol/pia/PIA.h"
++#include "zeek/analyzer/protocol/tcp/events.bif.h"
++#include "zeek/analyzer/protocol/tcp/types.bif.h"
++
+ 
+ using namespace zeek::packet_analysis::TCP;
+ using namespace zeek::packet_analysis::IP;
++using namespace zeek::analyzer::tcp;
++
++// The following are not included in all systems' tcp.h.
++
++#ifndef TH_ECE
++#define TH_ECE  0x40
++#endif
++
++#ifndef TH_CWR
++#define TH_CWR  0x80
++#endif
++
++constexpr int32_t TOO_LARGE_SEQ_DELTA = 1048576;
++constexpr int ORIG = 1;
++constexpr int RESP = 2;
++
++namespace { // local namespace
++	constexpr bool DEBUG_tcp_data_sent = false;
++	constexpr bool DEBUG_tcp_connection_close = false;
++}
+ 
+ TCPAnalyzer::TCPAnalyzer() : IPBasedAnalyzer("TCP", TRANSPORT_TCP, TCP_PORT_MASK)
+ 	{
++	// TODO: remove once the other plugins are done
++	new_plugin = true;
+ 	}
+ 
+ TCPAnalyzer::~TCPAnalyzer()
+@@ -35,6 +67,22 @@ bool TCPAnalyzer::BuildConnTuple(size_t len, const uint8_t* data, Packet* packet
+ 	return true;
+ 	}
+ 
++zeek::packet_analysis::IP::AnalyzerAdapter* TCPAnalyzer::MakeAnalyzerAdapter(Connection* conn)
++	{
++	auto* root = new TCPAnalyzerAdapter(conn);
++	root->SetParent(this);
++
++	conn->EnableStatusUpdateTimer();
++	conn->SetInactivityTimeout(zeek::detail::udp_inactivity_timeout);
++
++	return root;
++	}
++
++zeek::analyzer::pia::PIA* TCPAnalyzer::MakePIA(Connection* conn)
++	{
++	return new analyzer::pia::PIA_TCP(conn);
++	}
++
+ bool TCPAnalyzer::WantConnection(uint16_t src_port, uint16_t dst_port,
+                                  const u_char* data, bool& flip_roles) const
+ 	{
+@@ -74,3 +122,723 @@ bool TCPAnalyzer::WantConnection(uint16_t src_port, uint16_t dst_port,
+ 
+ 	return true;
+ 	}
++
++static uint64_t get_relative_seq(const TCP_Endpoint* endpoint,
++                                 uint32_t cur_base, uint32_t last,
++                                 uint32_t wraps, bool* underflow)
++	{
++	int32_t delta = zeek::seq_delta(cur_base, last);
++
++	if ( delta < 0 )
++		{
++		if ( wraps && cur_base > last )
++			// Seems to be a part of a previous 32-bit sequence space.
++			--wraps;
++		}
++
++	else if ( delta > 0 )
++		{
++		if ( cur_base < last )
++			// The sequence space wrapped around.
++			++wraps;
++		}
++
++	if ( wraps == 0 )
++		{
++		delta = zeek::seq_delta(cur_base, endpoint->StartSeq());
++
++		if ( underflow && delta < 0 )
++			*underflow = true;
++
++		return delta;
++		}
++
++	return endpoint->ToRelativeSeqSpace(cur_base, wraps);
++	}
++
++static int get_segment_len(int payload_len, TCP_Flags flags)
++	{
++	int seg_len = payload_len;
++
++	if ( flags.SYN() )
++		// SYN consumes a byte of sequence space.
++		++seg_len;
++
++	if ( flags.FIN() )
++		// FIN consumes a bytes of sequence space.
++		++seg_len;
++
++	if ( flags.RST() )
++		// Don't include the data in the computation of
++		// the sequence space for this connection, as
++		// it's not in fact part of the TCP stream.
++		seg_len -= payload_len;
++
++	return seg_len;
++	}
++
++static void init_endpoint(TCP_Endpoint* endpoint, TCP_Flags flags,
++                          uint32_t first_seg_seq, uint32_t last_seq, double t)
++	{
++	switch ( endpoint->state ) {
++	case TCP_ENDPOINT_INACTIVE:
++		if ( flags.SYN() )
++			{
++			endpoint->InitAckSeq(first_seg_seq);
++			endpoint->InitStartSeq(first_seg_seq);
++			}
++		else
++			{
++			// This is a partial connection - set up the initial sequence
++			// numbers as though we saw a SYN, to keep the relative byte
++			// numbering consistent.
++			endpoint->InitAckSeq(first_seg_seq - 1);
++			endpoint->InitStartSeq(first_seg_seq - 1);
++			// But ensure first packet is not marked duplicate
++			last_seq = first_seg_seq;
++			}
++
++		endpoint->InitLastSeq(last_seq);
++		endpoint->start_time = t;
++		break;
++
++	case TCP_ENDPOINT_SYN_SENT:
++	case TCP_ENDPOINT_SYN_ACK_SENT:
++		if ( flags.SYN() && first_seg_seq != endpoint->StartSeq() )
++			{
++			endpoint->Conn()->Weird("SYN_seq_jump");
++			endpoint->InitStartSeq(first_seg_seq);
++			endpoint->InitAckSeq(first_seg_seq);
++			endpoint->InitLastSeq(last_seq);
++			}
++		break;
++
++	case TCP_ENDPOINT_ESTABLISHED:
++	case TCP_ENDPOINT_PARTIAL:
++		if ( flags.SYN() )
++			{
++			if ( endpoint->Size() > 0 )
++				endpoint->Conn()->Weird("SYN_inside_connection");
++
++			if ( first_seg_seq != endpoint->StartSeq() )
++				endpoint->Conn()->Weird("SYN_seq_jump");
++
++			// Make a guess that somehow the connection didn't get established,
++			// and this SYN will be the one that actually sets it up.
++			endpoint->InitStartSeq(first_seg_seq);
++			endpoint->InitAckSeq(first_seg_seq);
++			endpoint->InitLastSeq(last_seq);
++			}
++		break;
++
++	case TCP_ENDPOINT_RESET:
++		if ( flags.SYN() )
++			{
++			if ( endpoint->prev_state == TCP_ENDPOINT_INACTIVE )
++				{
++				// Seq. numbers were initialized by a RST packet from this
++				// endpoint, but now that a SYN is seen from it, that could mean
++				// the earlier RST was spoofed/injected, so re-initialize.  This
++				// mostly just helps prevent misrepresentations of payload sizes
++				// that are based on bad initial sequence values.
++				endpoint->InitStartSeq(first_seg_seq);
++				endpoint->InitAckSeq(first_seg_seq);
++				endpoint->InitLastSeq(last_seq);
++				}
++			}
++		break;
++
++	default:
++		break;
++	}
++	}
++
++static void update_history(TCP_Flags flags, TCP_Endpoint* endpoint,
++			   uint64_t rel_seq, int len)
++	{
++	int bits_set = (flags.SYN() ? 1 : 0) + (flags.FIN() ? 1 : 0) +
++			(flags.RST() ? 1 : 0);
++	if ( bits_set > 1 )
++		{
++		if ( flags.FIN() && flags.RST() )
++			endpoint->CheckHistory(HIST_FIN_RST_PKT, 'I');
++		else
++			endpoint->CheckHistory(HIST_MULTI_FLAG_PKT, 'Q');
++		}
++
++	else if ( bits_set == 1 )
++		{
++		if ( flags.SYN() )
++			{
++			char code = flags.ACK() ? 'H' : 'S';
++
++			if ( endpoint->CheckHistory(HIST_SYN_PKT, code) &&
++			     rel_seq != endpoint->hist_last_SYN )
++				endpoint->AddHistory(code);
++
++			endpoint->hist_last_SYN = rel_seq;
++			}
++
++		if ( flags.FIN() )
++			{
++			// For FIN's, the sequence number comes at the
++			// end of (any data in) the packet, not the
++			// beginning as for SYNs and RSTs.
++			if ( endpoint->CheckHistory(HIST_FIN_PKT, 'F') &&
++			     rel_seq + len != endpoint->hist_last_FIN )
++				endpoint->AddHistory('F');
++
++			endpoint->hist_last_FIN = rel_seq + len;
++			}
++
++		if ( flags.RST() )
++			{
++			if ( endpoint->CheckHistory(HIST_RST_PKT, 'R') &&
++			     rel_seq != endpoint->hist_last_RST )
++				endpoint->AddHistory('R');
++
++			endpoint->hist_last_RST = rel_seq;
++			}
++		}
++
++	else
++		{ // bits_set == 0
++		if ( len )
++			endpoint->CheckHistory(HIST_DATA_PKT, 'D');
++
++		else if ( flags.ACK() )
++			endpoint->CheckHistory(HIST_ACK_PKT, 'A');
++		}
++	}
++
++static void init_window(TCP_Endpoint* endpoint, TCP_Endpoint* peer,
++			TCP_Flags flags, bro_int_t scale, uint32_t base_seq,
++			uint32_t ack_seq)
++	{
++	// ### In the following, we could be fooled by an
++	// inconsistent SYN retransmission.  Where's a normalizer
++	// when you need one?
++
++	if ( scale < 0 )
++		{ // no window scaling option
++		if ( flags.ACK() )
++			{ // window scaling not negotiated
++			endpoint->window_scale = 0;
++			peer->window_scale = 0;
++			}
++		else
++			// We're not offering window scaling.
++			// Ideally, we'd remember this fact so that
++			// if the SYN/ACK *does* include window
++			// scaling, we know it won't be negotiated.
++			// But it's a pain to track that, and hard
++			// to see how an adversarial responder could
++			// use it to evade.  Also, if we *do* want
++			// to track it, we could do so using
++			// connection_SYN_packet.
++			endpoint->window_scale = 0;
++		}
++	else
++		{
++		endpoint->window_scale = scale;
++		endpoint->window_seq = base_seq;
++		endpoint->window_ack_seq = ack_seq;
++
++		peer->window_seq = ack_seq;
++		peer->window_ack_seq = base_seq;
++		}
++	}
++
++static void update_window(TCP_Endpoint* endpoint, unsigned int window,
++                          uint32_t base_seq, uint32_t ack_seq, TCP_Flags flags)
++	{
++	// Note, applying scaling here would be incorrect for an initial SYN,
++	// whose window value is always unscaled.  However, we don't
++	// check the window's value for recision in that case anyway, so
++	// no-harm-no-foul.
++	int scale = endpoint->window_scale;
++	window = window << scale;
++
++	// Zero windows are boring if either (1) they come with a RST packet
++	// or after a RST packet, or (2) they come after the peer has sent
++	// a FIN (because there's no relevant window at that point anyway).
++	// (They're also boring if they come after the peer has sent a RST,
++	// but *nothing* should be sent in response to a RST, so we ignore
++	// that case.)
++	//
++	// However, they *are* potentially interesting if sent by an
++	// endpoint that's already sent a FIN, since that FIN meant "I'm
++	// not going to send any more", but doesn't mean "I won't receive
++	// any more".
++	if ( window == 0 && ! flags.RST() &&
++	     endpoint->peer->state != TCP_ENDPOINT_CLOSED &&
++	     endpoint->state != TCP_ENDPOINT_RESET )
++		endpoint->ZeroWindow();
++
++	// Don't analyze window values off of SYNs, they're sometimes
++	// immediately rescinded.  Also don't do so for FINs or RSTs,
++	// or if the connection has already been partially closed, since
++	// such recisions occur frequently in practice, probably as the
++	// receiver loses buffer memory due to its process going away.
++
++	if ( ! flags.SYN() && ! flags.FIN() && ! flags.RST() &&
++	     endpoint->state != TCP_ENDPOINT_CLOSED &&
++	     endpoint->state != TCP_ENDPOINT_RESET )
++		{
++		// ### Decide whether to accept new window based on Active
++		// Mapping policy.
++		if ( zeek::seq_delta(base_seq, endpoint->window_seq) >= 0 &&
++		     zeek::seq_delta(ack_seq, endpoint->window_ack_seq) >= 0 )
++			{
++			uint32_t new_edge = ack_seq + window;
++			uint32_t old_edge = endpoint->window_ack_seq + endpoint->window;
++			int32_t advance = zeek::seq_delta(new_edge, old_edge);
++
++			if ( advance < 0 )
++				{
++				// An apparent window recision.  Allow a
++				// bit of slop for window scaling.  This is
++				// because sometimes there will be an
++				// apparent recision due to the granularity
++				// of the scaling.
++				if ( (-advance) >= (1 << scale) )
++					endpoint->Conn()->Weird("window_recision");
++				}
++
++			endpoint->window = window;
++			endpoint->window_ack_seq = ack_seq;
++			endpoint->window_seq = base_seq;
++			}
++		}
++	}
++
++static zeek::IntrusivePtr<zeek::RecordVal> build_syn_packet_val(
++	bool is_orig, const zeek::IP_Hdr* ip,
++	const struct tcphdr* tcp)
++	{
++	int winscale = -1;
++	int MSS = 0;
++	int SACK = 0;
++
++	// Parse TCP options.
++	u_char* options = (u_char*) tcp + sizeof(struct tcphdr);
++	u_char* opt_end = (u_char*) tcp + tcp->th_off * 4;
++
++	while ( options < opt_end )
++		{
++		unsigned int opt = options[0];
++
++		if ( opt == TCPOPT_EOL )
++			// All done - could flag if more junk left over ....
++			break;
++
++		if ( opt == TCPOPT_NOP )
++			{
++			++options;
++			continue;
++			}
++
++		if ( options + 1 >= opt_end )
++			// We've run off the end, no room for the length.
++			break;
++
++		unsigned int opt_len = options[1];
++
++		if ( options + opt_len > opt_end )
++			// No room for rest of option.
++			break;
++
++		if ( opt_len == 0 )
++			// Trashed length field.
++			break;
++
++		switch ( opt ) {
++		case TCPOPT_SACK_PERMITTED:
++			SACK = 1;
++			break;
++
++		case TCPOPT_MAXSEG:
++			if ( opt_len < 4 )
++				break;	// bad length
++
++			MSS = (options[2] << 8) | options[3];
++			break;
++
++		case 3: // TCPOPT_WSCALE
++			if ( opt_len < 3 )
++				break;	// bad length
++
++			winscale = options[2];
++			break;
++
++		default:	// just skip over
++			break;
++		}
++
++		options += opt_len;
++		}
++
++	static auto SYN_packet = zeek::id::find_type<zeek::RecordType>("SYN_packet");
++	auto v = zeek::make_intrusive<zeek::RecordVal>(SYN_packet);
++
++	v->Assign(0, is_orig);
++	v->Assign(1, static_cast<bool>(ip->DF()));
++	v->Assign(2, ip->TTL());
++	v->Assign(3, ip->TotalLen());
++	v->Assign(4, ntohs(tcp->th_win));
++	v->Assign(5, winscale);
++	v->Assign(6, MSS);
++	v->Assign(7, static_cast<bool>(SACK));
++
++	return v;
++	}
++
++static void init_peer(TCP_Endpoint* peer, TCP_Endpoint* endpoint,
++                      TCP_Flags flags, uint32_t ack_seq)
++	{
++	if ( ! flags.SYN() && ! flags.FIN() && ! flags.RST() )
++		{
++		if ( endpoint->state == TCP_ENDPOINT_SYN_SENT ||
++			 endpoint->state == TCP_ENDPOINT_SYN_ACK_SENT ||
++			 endpoint->state == TCP_ENDPOINT_ESTABLISHED )
++			{
++			// We've already sent a SYN, but that
++			// hasn't roused the other end, yet we're
++			// ack'ing their data.
++
++			if ( ! endpoint->Conn()->DidWeird() )
++				endpoint->Conn()->Weird("possible_split_routing");
++			}
++		}
++
++	// Start the sequence numbering as if there was an initial
++	// SYN, so the relative numbering of subsequent data packets
++	// stays consistent.
++	peer->InitStartSeq(ack_seq - 1);
++	peer->InitAckSeq(ack_seq - 1);
++	peer->InitLastSeq(ack_seq - 1);
++	}
++
++static void update_ack_seq(TCP_Endpoint* endpoint, uint32_t ack_seq)
++	{
++	int32_t delta_ack = zeek::seq_delta(ack_seq, endpoint->AckSeq());
++
++	if ( ack_seq == 0 && delta_ack > TOO_LARGE_SEQ_DELTA )
++		// More likely that this is a broken ack than a
++		// large connection that happens to land on 0 in the
++		// sequence space.
++		;
++	else if ( delta_ack > 0 )
++		endpoint->UpdateAckSeq(ack_seq);
++	}
++
++// Returns the difference between last_seq and the last sequence
++// seen by the endpoint (may be negative).
++static int32_t update_last_seq(TCP_Endpoint* endpoint, uint32_t last_seq,
++                               TCP_Flags flags, int len)
++	{
++	int32_t delta_last = zeek::seq_delta(last_seq, endpoint->LastSeq());
++
++	if ( (flags.SYN() || flags.RST()) &&
++	     (delta_last > TOO_LARGE_SEQ_DELTA ||
++		 delta_last < -TOO_LARGE_SEQ_DELTA) )
++		// ### perhaps trust RST seq #'s if initial and not too
++		// outlandish, but not if they're coming after the other
++		// side has sent a FIN - trust the FIN ack instead
++		;
++
++	else if ( flags.FIN() &&
++		  endpoint->LastSeq() == endpoint->StartSeq() + 1 )
++		// Update last_seq based on the FIN even if delta_last < 0.
++		// This is to accommodate > 2 GB connections for which
++		// we've only seen the SYN and the FIN (hence the check
++		// for last_seq == start_seq + 1).
++		endpoint->UpdateLastSeq(last_seq);
++
++	else if ( endpoint->state == TCP_ENDPOINT_RESET )
++		// don't trust any subsequent sequence numbers
++		;
++
++	else if ( delta_last > 0 )
++		// ### check for large jumps here.
++		// ## endpoint->last_seq = last_seq;
++		endpoint->UpdateLastSeq(last_seq);
++
++	else if ( delta_last <= 0 && len > 0 )
++		endpoint->DidRxmit();
++
++	return delta_last;
++	}
++
++void TCPAnalyzer::DeliverPacket(Connection* c, double t, bool is_orig, int remaining, Packet* pkt)
++	{
++	conn = c;
++	auto* ta = static_cast<TCPAnalyzerAdapter*>(conn->GetRootAnalyzer());
++
++	const u_char* data = pkt->ip_hdr->Payload();
++	int len = pkt->ip_hdr->PayloadLen();
++
++	// TODO: remove this
++	int caplen = remaining;
++
++	const struct tcphdr* tp = ExtractTCP_Header(data, len, remaining);
++	if ( ! tp )
++		return;
++
++	const std::unique_ptr<IP_Hdr>& ip = pkt->ip_hdr;
++
++	ta->DeliverPacket(len, data, is_orig, tp->th_seq, ip.get(), remaining);
++
++	// We need the min() here because Ethernet frame padding can lead to
++	// caplen > len.
++	if ( packet_contents )
++		ta->PacketContents(data, std::min(len, caplen));
++
++	analyzer::tcp::TCP_Endpoint* endpoint = is_orig ? ta->orig : ta->resp;
++	analyzer::tcp::TCP_Endpoint* peer = endpoint->peer;
++
++	if ( ! ValidateChecksum(ip.get(), tp, endpoint, len, caplen) )
++		return;
++
++	uint32_t tcp_hdr_len = data - (const u_char*) tp;
++	analyzer::tcp::TCP_Flags flags(tp);
++	ta->SetPartialStatus(flags, endpoint->IsOrig());
++
++	uint32_t base_seq = ntohl(tp->th_seq);
++	uint32_t ack_seq = ntohl(tp->th_ack);
++
++	int seg_len = get_segment_len(len, flags);
++	uint32_t seq_one_past_segment = base_seq + seg_len;
++
++	init_endpoint(endpoint, flags, base_seq, seq_one_past_segment,
++	              run_state::current_timestamp);
++
++	bool seq_underflow = false;
++	uint64_t rel_seq = get_relative_seq(endpoint, base_seq, endpoint->LastSeq(),
++	                                    endpoint->SeqWraps(), &seq_underflow);
++
++	if ( seq_underflow && ! flags.RST() )
++		// Can't tell if if this is a retransmit/out-of-order or something
++		// before the sequence Bro initialized the endpoint at or the TCP is
++		// just broken and sending garbage sequences.  In either case, some
++		// standard analysis doesn't apply (e.g. reassembly).
++		Weird("TCP_seq_underflow_or_misorder");
++
++	update_history(flags, endpoint, rel_seq, len);
++	update_window(endpoint, ntohs(tp->th_win), base_seq, ack_seq, flags);
++
++	if ( ! ta->orig->did_close || ! ta->resp->did_close )
++		conn->SetLastTime(run_state::current_timestamp);
++
++	if ( flags.SYN() )
++		{
++		ta->SynWeirds(flags, endpoint, len);
++		auto SYN_vals = build_syn_packet_val(is_orig, ip.get(), tp);
++		init_window(endpoint, peer, flags, SYN_vals->GetFieldAs<IntVal>(5),
++		            base_seq, ack_seq);
++
++		if ( connection_SYN_packet )
++			ta->EnqueueConnEvent(connection_SYN_packet, ta->ConnVal(), SYN_vals);
++		}
++
++	if ( flags.FIN() )
++		{
++		++endpoint->FIN_cnt;
++
++		if ( endpoint->FIN_cnt >= detail::tcp_storm_thresh && run_state::current_timestamp <
++		     endpoint->last_time + detail::tcp_storm_interarrival_thresh )
++			Weird("FIN_storm");
++
++		endpoint->FIN_seq = rel_seq + seg_len;
++		}
++
++	if ( flags.RST() )
++		{
++		++endpoint->RST_cnt;
++
++		if ( endpoint->RST_cnt >= detail::tcp_storm_thresh && run_state::current_timestamp <
++		     endpoint->last_time + detail::tcp_storm_interarrival_thresh )
++			Weird("RST_storm");
++
++		// This now happens often enough that it's
++		// not in the least interesting.
++		//if ( len > 0 )
++		//	Weird("RST_with_data");
++
++		ta->PacketWithRST();
++		}
++
++	uint64_t rel_ack = 0;
++
++	if ( flags.ACK() )
++		{
++		if ( is_orig && ! ta->seen_first_ACK &&
++		     (endpoint->state == TCP_ENDPOINT_ESTABLISHED ||
++		      endpoint->state == TCP_ENDPOINT_SYN_SENT) )
++			{
++			ta->seen_first_ACK = true;
++			ta->Event(connection_first_ACK);
++			}
++
++		if ( peer->state == TCP_ENDPOINT_INACTIVE )
++			{
++			rel_ack = 1;
++			init_peer(peer, endpoint, flags, ack_seq);
++			}
++		else
++			{
++			bool ack_underflow = false;
++			rel_ack = get_relative_seq(peer, ack_seq, peer->AckSeq(),
++			                           peer->AckWraps(), &ack_underflow);
++
++			if ( ack_underflow )
++				{
++				rel_ack = 0;
++				Weird("TCP_ack_underflow_or_misorder");
++				}
++			else if ( ! flags.RST() )
++				// Don't trust ack's in RST packets.
++				update_ack_seq(peer, ack_seq);
++			}
++		}
++
++	int32_t delta_last = update_last_seq(endpoint, seq_one_past_segment, flags, len);
++	endpoint->last_time = run_state::current_timestamp;
++
++	bool do_close;
++	bool gen_event;
++	ta->UpdateStateMachine(run_state::current_timestamp, endpoint, peer, base_seq, ack_seq,
++	                       len, delta_last, is_orig, flags, do_close, gen_event);
++
++	if ( flags.ACK() )
++		// We wait on doing this until we've updated the state
++		// machine so that if the ack reveals a content gap,
++		// we can tell whether it came at the very end of the
++		// connection (in a FIN or RST).  Those gaps aren't
++		// reliable - especially those for RSTs - and we refrain
++		// from flagging them in the connection history.
++		peer->AckReceived(rel_ack);
++
++	if ( tcp_packet )
++		ta->EnqueueConnEvent(tcp_packet,
++		                     ta->ConnVal(),
++		                     val_mgr->Bool(is_orig),
++		                     make_intrusive<StringVal>(flags.AsString()),
++		                     val_mgr->Count(rel_seq),
++		                     val_mgr->Count(flags.ACK() ? rel_ack : 0),
++		                     val_mgr->Count(len),
++		                     // We need the min() here because Ethernet padding can lead to
++		                     // caplen > len.
++		                     make_intrusive<StringVal>(std::min(caplen, len), (const char*) data));
++
++	if ( (tcp_option || tcp_options) && tcp_hdr_len > sizeof(*tp) )
++		ParseTCPOptions(tp, is_orig);
++
++	// PIA/signature matching state needs to be initialized before
++	// processing/reassembling any TCP data, since that processing may
++	// itself try to perform signature matching.  Also note that a SYN
++	// packet may technically carry data (see RFC793 Section 3.4 and also
++	// TCP Fast Open).
++	CheckPIA_FirstPacket(is_orig, ip);
++
++	if ( DEBUG_tcp_data_sent )
++		{
++		DEBUG_MSG("%.6f before DataSent: len=%d caplen=%d skip=%d\n",
++		          run_state::network_time, len, caplen, ta->Skipping());
++		}
++
++	uint64_t rel_data_seq = flags.SYN() ? rel_seq + 1 : rel_seq;
++
++	int need_contents = 0;
++	if ( len > 0 && (caplen >= len || packet_children.size()) &&
++	     ! flags.RST() && ! Skipping() && ! seq_underflow )
++		need_contents = DeliverData(run_state::current_timestamp, data, len, caplen, ip,
++		                            tp, endpoint, rel_data_seq, is_orig, flags);
++
++	endpoint->CheckEOF();
++
++	if ( do_close )
++		{
++		// We need to postpone doing this until after we process
++		// DataSent, so we don't generate a connection_finished event
++		// until after data perhaps included with the FIN is processed.
++		ConnectionClosed(endpoint, peer, gen_event);
++		}
++
++	CheckRecording(need_contents, flags);
++
++	ForwardPacket(len, data, pkt);
++
++	// Handle child_packet analyzers.  Note: This happens *after* the
++	// packet has been processed and the TCP state updated.
++	zeek::analyzer::analyzer_list::iterator next;
++
++	for ( auto i = packet_children.begin(); i != packet_children.end(); /* nop */ )
++		{
++		auto child = *i;
++
++		if ( child->IsFinished() || child->Removing() )
++			{
++			if ( child->Removing() )
++				child->Done();
++
++			DBG_LOG(DBG_ANALYZER, "%s deleted child %s",
++			        fmt_analyzer(this).c_str(), fmt_analyzer(child).c_str());
++			i = packet_children.erase(i);
++			delete child;
++			}
++		else
++			{
++			child->NextPacket(len, data, is_orig, rel_data_seq, ip, caplen);
++			++i;
++			}
++		}
++
++	if ( ! reassembling )
++		ta->ForwardPacket(len, data, is_orig, rel_data_seq, ip.get(), caplen);
++	}
++
++const struct tcphdr* TCPAnalyzer::ExtractTCP_Header(
++	const u_char*& data, int& len, int& caplen)
++	{
++	const struct tcphdr* tp = (const struct tcphdr*) data;
++	uint32_t tcp_hdr_len = tp->th_off * 4;
++
++	if ( tcp_hdr_len < sizeof(struct tcphdr) )
++		{
++		Weird("bad_TCP_header_len");
++		return nullptr;
++		}
++
++	if ( tcp_hdr_len > uint32_t(len) ||
++	     tcp_hdr_len > uint32_t(caplen) )
++		{
++		// This can happen even with the above test, due to TCP
++		// options.
++		Weird("truncated_header");
++		return nullptr;
++		}
++
++	len -= tcp_hdr_len;	// remove TCP header
++	caplen -= tcp_hdr_len;
++	data += tcp_hdr_len;
++
++	return tp;
++	}
++
++bool TCPAnalyzer::ValidateChecksum(const IP_Hdr* ip, const struct tcphdr* tp,
++                                   analyzer::tcp::TCP_Endpoint* endpoint, int len,
++                                   int caplen)
++	{
++	if ( ! run_state::current_pkt->l3_checksummed &&
++	     ! detail::ignore_checksums &&
++	     ! zeek::id::find_val<TableVal>("ignore_checksums_nets")->Contains(ip->IPHeaderSrcAddr()) &&
++	     caplen >= len && ! endpoint->ValidChecksum(tp, len, ip->IP4_Hdr()) )
++		{
++		Weird("bad_TCP_checksum");
++		endpoint->ChecksumError();
++		return false;
++		}
++	else
++		return true;
++	}
+diff --git a/src/packet_analysis/protocol/tcp/TCP.h b/src/packet_analysis/protocol/tcp/TCP.h
+index 88f6d4dd4..ebc948e77 100644
+--- a/src/packet_analysis/protocol/tcp/TCP.h
++++ b/src/packet_analysis/protocol/tcp/TCP.h
+@@ -6,6 +6,8 @@
+ #include "zeek/packet_analysis/Component.h"
+ #include "zeek/packet_analysis/protocol/ip/IPBasedAnalyzer.h"
+ 
++#include "zeek/analyzer/protocol/tcp/TCP_Endpoint.h"
++
+ namespace zeek::packet_analysis::TCP {
+ 
+ class TCPAnalyzer final : public IP::IPBasedAnalyzer {
+@@ -26,6 +28,9 @@ protected:
+ 	bool BuildConnTuple(size_t len, const uint8_t* data, Packet* packet,
+ 	                    ConnTuple& tuple) override;
+ 
++	void DeliverPacket(Connection* c, double t, bool is_orig, int remaining,
++	                   Packet* pkt) override;
++
+ 	/**
+ 	 * Upon seeing the first packet of a connection, checks whether we want
+ 	 * to analyze it (e.g. we may not want to look at partial connections)
+@@ -40,6 +45,30 @@ protected:
+ 	 */
+ 	bool WantConnection(uint16_t src_port, uint16_t dst_port,
+ 	                    const u_char* data, bool& flip_roles) const override;
++
++	packet_analysis::IP::AnalyzerAdapter* MakeAnalyzerAdapter(Connection* conn) override;
++	analyzer::pia::PIA* MakePIA(Connection* conn) override;
++
++	int ParseTCPOptions(const struct tcphdr* tcp, bool is_orig);
++
++private:
++
++	/**
++	 * Returns the TCP header pointed to by data (which we assume is
++	 * aligned), updating data, len & caplen.  Returns nil if the header
++	 * isn't fully present.
++	 */
++	const struct tcphdr* ExtractTCP_Header(const u_char*& data, int& len, int& caplen);
++
++	/**
++	 * Returns true if the checksum is valid, false if not (and in which
++	 * case also updates the status history of the endpoint).
++	 */
++	bool ValidateChecksum(const IP_Hdr* ip, const struct tcphdr* tp,
++	                      analyzer::tcp::TCP_Endpoint* endpoint,
++	                      int len, int caplen);
++
++	Connection* conn;
+ };
+ 
+ }
+diff --git a/src/packet_analysis/protocol/tcp/TCPAnalyzerAdapter.cc b/src/packet_analysis/protocol/tcp/TCPAnalyzerAdapter.cc
+new file mode 100644
+index 000000000..42cb39f59
+--- /dev/null
++++ b/src/packet_analysis/protocol/tcp/TCPAnalyzerAdapter.cc
+@@ -0,0 +1,364 @@
++#include "zeek/packet_analysis/protocol/tcp/TCPAnalyzerAdapter.h"
++
++#include "zeek/Conn.h"
++#include "zeek/analyzer/protocol/tcp/TCP.h"
++
++#include "zeek/analyzer/protocol/tcp/events.bif.h"
++#include "zeek/analyzer/protocol/tcp/types.bif.h"
++
++using namespace zeek::packet_analysis;
++using namespace zeek::packet_analysis::TCP;
++using namespace zeek::analyzer::tcp;
++
++TCPAnalyzerAdapter:: TCPAnalyzerAdapter(Connection* conn) : IP::AnalyzerAdapter("TCP", conn)
++	{
++	orig = new analyzer::tcp::TCP_Endpoint(this, true);
++	resp = new analyzer::tcp::TCP_Endpoint(this, false);
++
++	orig->SetPeer(resp);
++	resp->SetPeer(orig);
++	}
++
++TCPAnalyzerAdapter::~TCPAnalyzerAdapter()
++	{
++	}
++
++void TCPAnalyzerAdapter::AddExtraAnalyzers(Connection* conn)
++	{
++	}
++
++void TCPAnalyzerAdapter::UpdateConnVal(RecordVal* conn_val)
++	{
++	}
++
++void TCPAnalyzerAdapter::UpdateEndpointVal(const ValPtr& endp_arg, bool is_orig)
++	{
++	}
++
++void TCPAnalyzerAdapter::SynWeirds(analyzer::tcp::TCP_Flags flags, analyzer::tcp::TCP_Endpoint* endpoint, int data_len) const
++	{
++	if ( flags.RST() )
++		endpoint->Conn()->Weird("TCP_christmas", "", GetAnalyzerName());
++
++	if ( flags.URG() )
++		endpoint->Conn()->Weird("baroque_SYN", "", GetAnalyzerName());
++
++	if ( data_len > 0 )
++		// Not technically wrong according to RFC 793, but the other side
++		// would be forced to buffer data until the handshake succeeds, and
++		// that could be bad in some cases, e.g. SYN floods.
++		// T/TCP definitely complicates this.
++		endpoint->Conn()->Weird("SYN_with_data", "", GetAnalyzerName());
++	}
++
++void TCPAnalyzerAdapter::PacketWithRST()
++	{
++	const analyzer::analyzer_list& children(GetChildren());
++	LOOP_OVER_CONST_CHILDREN(i)
++		static_cast<analyzer::tcp::TCP_ApplicationAnalyzer *>(*i)->PacketWithRST();
++	}
++
++void TCPAnalyzerAdapter::UpdateStateMachine(double t,
++			analyzer::tcp::TCP_Endpoint* endpoint, analyzer::tcp::TCP_Endpoint* peer,
++			uint32_t base_seq, uint32_t ack_seq,
++			int len, int32_t delta_last, bool is_orig, analyzer::tcp::TCP_Flags flags,
++			bool& do_close, bool& gen_event)
++	{
++	do_close = false;	// whether to report the connection as closed
++	gen_event = false;	// if so, whether to generate an event
++
++	switch ( endpoint->state ) {
++
++	case TCP_ENDPOINT_INACTIVE:
++		UpdateInactiveState(t, endpoint, peer, base_seq, ack_seq,
++					len, is_orig, flags,
++					do_close, gen_event);
++		break;
++
++	case TCP_ENDPOINT_SYN_SENT:
++	case TCP_ENDPOINT_SYN_ACK_SENT:
++		UpdateSYN_SentState(endpoint, peer, len, is_orig, flags, do_close,
++		                    gen_event);
++		break;
++
++	case TCP_ENDPOINT_ESTABLISHED:
++	case TCP_ENDPOINT_PARTIAL:
++		UpdateEstablishedState(endpoint, peer, flags, do_close, gen_event);
++		break;
++
++	case TCP_ENDPOINT_CLOSED:
++		UpdateClosedState(t, endpoint, delta_last, flags, do_close);
++		break;
++
++	case TCP_ENDPOINT_RESET:
++		UpdateResetState(len, flags);
++		break;
++	}
++	}
++
++void TCPAnalyzerAdapter::UpdateInactiveState(double t,
++			analyzer::tcp::TCP_Endpoint* endpoint, analyzer::tcp::TCP_Endpoint* peer,
++			uint32_t base_seq, uint32_t ack_seq,
++			int len, bool is_orig, analyzer::tcp::TCP_Flags flags,
++			bool& do_close, bool& gen_event)
++	{
++	if ( flags.SYN() )
++		{
++		if ( is_orig )
++			{
++			if ( flags.ACK() )
++				{
++				Weird("connection_originator_SYN_ack");
++				endpoint->SetState(TCP_ENDPOINT_SYN_ACK_SENT);
++				}
++			else
++				endpoint->SetState(TCP_ENDPOINT_SYN_SENT);
++
++			if ( zeek::detail::tcp_attempt_delay )
++				ADD_ANALYZER_TIMER(&TCPAnalyzerAdapter::AttemptTimer,
++				                   t + detail::tcp_attempt_delay, true,
++				                   detail::TIMER_TCP_ATTEMPT);
++			}
++		else
++			{
++			if ( flags.ACK() )
++				{
++				if ( peer->state != TCP_ENDPOINT_INACTIVE &&
++				     peer->state != TCP_ENDPOINT_PARTIAL &&
++				     ! seq_between(ack_seq, peer->StartSeq(), peer->LastSeq()) )
++					Weird("bad_SYN_ack");
++				}
++
++			else if ( peer->state == TCP_ENDPOINT_SYN_ACK_SENT &&
++				  base_seq == endpoint->StartSeq() )
++				{
++				// This is a SYN/SYN-ACK reversal,
++				// per the discussion in IsReuse.
++				// Flip the endpoints and establish
++				// the connection.
++				is_partial = 0;
++				Conn()->FlipRoles();
++				peer->SetState(TCP_ENDPOINT_ESTABLISHED);
++				}
++
++			else
++				Weird("simultaneous_open");
++
++			if ( peer->state == TCP_ENDPOINT_SYN_SENT )
++				peer->SetState(TCP_ENDPOINT_ESTABLISHED);
++			else if ( peer->state == TCP_ENDPOINT_INACTIVE )
++				{
++				// If we were to ignore SYNs and
++				// only instantiate state on SYN
++				// acks, then we'd do:
++				//    peer->SetState(TCP_ENDPOINT_ESTABLISHED);
++				// here.
++				Weird("unsolicited_SYN_response");
++				}
++
++			endpoint->SetState(TCP_ENDPOINT_ESTABLISHED);
++
++			if ( peer->state != TCP_ENDPOINT_PARTIAL )
++				{
++				Event(connection_established);
++				Conn()->EnableStatusUpdateTimer();
++				}
++			}
++		}
++
++	if ( flags.FIN() )
++		{
++		endpoint->SetState(TCP_ENDPOINT_CLOSED);
++		do_close = gen_event = true;
++		if ( peer->state != TCP_ENDPOINT_PARTIAL && ! flags.SYN() )
++			Weird("spontaneous_FIN");
++		}
++
++	if ( flags.RST() )
++		{
++		endpoint->SetState(TCP_ENDPOINT_RESET);
++
++		bool is_reject = false;
++
++		if ( is_orig )
++			{
++			// If our peer is established then we saw
++			// a SYN-ack but not SYN - so a reverse
++			// scan, and we should treat this as a
++			// reject.
++			if ( peer->state == TCP_ENDPOINT_ESTABLISHED )
++				is_reject = true;
++			}
++
++		else if ( peer->state == TCP_ENDPOINT_SYN_SENT ||
++			  peer->state == TCP_ENDPOINT_SYN_ACK_SENT )
++			// We're rejecting an initial SYN.
++			is_reject = true;
++
++		do_close = true;
++		gen_event = ! is_reject;
++
++		if ( is_reject )
++			Event(connection_rejected);
++
++		else if ( peer->state == TCP_ENDPOINT_INACTIVE )
++			Weird("spontaneous_RST");
++		}
++
++	if ( endpoint->state == TCP_ENDPOINT_INACTIVE )
++		{ // No control flags to change the state.
++		if ( ! is_orig && len == 0 &&
++		     orig->state == TCP_ENDPOINT_SYN_SENT )
++			// Some eccentric TCP's will ack an initial
++			// SYN prior to sending a SYN reply (hello,
++			// ftp.microsoft.com).  For those, don't
++			// consider the ack as forming a partial
++			// connection.
++			;
++
++		else if ( flags.ACK() && peer->state == TCP_ENDPOINT_ESTABLISHED )
++			{
++			// No SYN packet from originator but SYN/ACK from
++			// responder, and now a pure ACK. Problably means we
++			// just missed that initial SYN. Let's not treat it
++			// as partial and instead establish the connection.
++			endpoint->SetState(TCP_ENDPOINT_ESTABLISHED);
++			is_partial = 0;
++			}
++
++		else
++			{
++			endpoint->SetState(TCP_ENDPOINT_PARTIAL);
++			Conn()->EnableStatusUpdateTimer();
++
++			if ( peer->state == TCP_ENDPOINT_PARTIAL )
++				// We've seen both sides of a partial
++				// connection, report it.
++				Event(partial_connection);
++			}
++		}
++	}
++
++void TCPAnalyzerAdapter::UpdateSYN_SentState(analyzer::tcp::TCP_Endpoint* endpoint, analyzer::tcp::TCP_Endpoint* peer,
++				       int len, bool is_orig, analyzer::tcp::TCP_Flags flags,
++				       bool& do_close, bool& gen_event)
++	{
++	if ( flags.SYN() )
++		{
++		if ( is_orig )
++			{
++			if ( flags.ACK() && ! flags.FIN() && ! flags.RST() &&
++			     endpoint->state != TCP_ENDPOINT_SYN_ACK_SENT )
++				Weird("repeated_SYN_with_ack");
++			}
++		else
++			{
++			if ( ! flags.ACK() &&
++			     endpoint->state != TCP_ENDPOINT_SYN_SENT )
++				Weird("repeated_SYN_reply_wo_ack");
++			}
++		}
++
++	if ( flags.FIN() )
++		{
++		if ( peer->state == TCP_ENDPOINT_INACTIVE ||
++		     peer->state == TCP_ENDPOINT_SYN_SENT )
++			Weird("inappropriate_FIN");
++
++		endpoint->SetState(TCP_ENDPOINT_CLOSED);
++		do_close = gen_event = true;
++		}
++
++	if ( flags.RST() )
++		{
++		endpoint->SetState(TCP_ENDPOINT_RESET);
++		ConnectionReset();
++		do_close = true;
++		}
++
++	else if ( len > 0 )
++		Weird("data_before_established");
++	}
++
++void TCPAnalyzerAdapter::UpdateEstablishedState(
++			analyzer::tcp::TCP_Endpoint* endpoint, analyzer::tcp::TCP_Endpoint* peer,
++			analyzer::tcp::TCP_Flags flags, bool& do_close, bool& gen_event)
++	{
++	if ( flags.SYN() )
++		{
++		if ( endpoint->state == TCP_ENDPOINT_PARTIAL &&
++		     peer->state == TCP_ENDPOINT_INACTIVE && ! flags.ACK() )
++			{
++			Weird("SYN_after_partial");
++			endpoint->SetState(TCP_ENDPOINT_SYN_SENT);
++			}
++		}
++
++	if ( flags.FIN() && ! flags.RST() )	// ###
++		{ // should check sequence/ack numbers here ###
++		endpoint->SetState(TCP_ENDPOINT_CLOSED);
++
++		if ( peer->state == TCP_ENDPOINT_RESET &&
++		     peer->prev_state == TCP_ENDPOINT_CLOSED )
++			// The peer sent a FIN followed by a RST.
++			// Turn it back into CLOSED state, because
++			// this was actually normal termination.
++			peer->SetState(TCP_ENDPOINT_CLOSED);
++
++		do_close = gen_event = true;
++		}
++
++	if ( flags.RST() )
++		{
++		endpoint->SetState(TCP_ENDPOINT_RESET);
++		do_close = true;
++
++		if ( peer->state != TCP_ENDPOINT_RESET ||
++		     peer->prev_state != TCP_ENDPOINT_ESTABLISHED )
++			ConnectionReset();
++		}
++	}
++
++void TCPAnalyzerAdapter::UpdateClosedState(double t, analyzer::tcp::TCP_Endpoint* endpoint,
++				int32_t delta_last, analyzer::tcp::TCP_Flags flags, bool& do_close)
++	{
++	if ( flags.SYN() )
++		Weird("SYN_after_close");
++
++	if ( flags.FIN() && delta_last > 0 )
++		// Probably should also complain on FIN recision.
++		// That requires an extra state variable to avoid
++		// generating slews of weird's when a TCP gets
++		// seriously confused (this from experience).
++		Weird("FIN_advanced_last_seq");
++
++	// Previously, our state was CLOSED, since we sent a FIN.
++	// If our peer was also closed, then don't change our state
++	// now on a RST, since this connection has already seen a FIN
++	// exchange.
++	if ( flags.RST() && endpoint->peer->state != TCP_ENDPOINT_CLOSED )
++		{
++		endpoint->SetState(TCP_ENDPOINT_RESET);
++
++		if ( ! endpoint->did_close )
++			// RST after FIN.
++			do_close = true;
++
++		if ( connection_reset )
++			ADD_ANALYZER_TIMER(&TCPAnalyzerAdapter::ResetTimer,
++			                   t + zeek::detail::tcp_reset_delay, true,
++			                   zeek::detail::TIMER_TCP_RESET);
++		}
++	}
++
++void TCPAnalyzerAdapter::UpdateResetState(int len, analyzer::tcp::TCP_Flags flags)
++	{
++	if ( flags.SYN() )
++		Weird("SYN_after_reset");
++
++	if ( flags.FIN() )
++		Weird("FIN_after_reset");
++
++	if ( len > 0 && ! flags.RST() )
++		Weird("data_after_reset");
++	}
+diff --git a/src/packet_analysis/protocol/tcp/TCPAnalyzerAdapter.h b/src/packet_analysis/protocol/tcp/TCPAnalyzerAdapter.h
+new file mode 100644
+index 000000000..a59f13f6e
+--- /dev/null
++++ b/src/packet_analysis/protocol/tcp/TCPAnalyzerAdapter.h
+@@ -0,0 +1,132 @@
++#pragma once
++
++#include "zeek/packet_analysis/protocol/ip/AnalyzerAdapter.h"
++#include "zeek/analyzer/protocol/tcp/TCP_Endpoint.h"
++#include "zeek/analyzer/protocol/tcp/TCP_Flags.h"
++
++namespace zeek::packet_analysis::TCP {
++
++class TCPAnalyzerAdapter final : public IP::AnalyzerAdapter {
++
++public:
++
++	TCPAnalyzerAdapter(Connection* conn);
++	~TCPAnalyzerAdapter() override;
++
++	static zeek::analyzer::Analyzer* Instantiate(Connection* conn)
++		{
++		return new TCPAnalyzerAdapter(conn);
++		}
++
++	void AddExtraAnalyzers(Connection* conn) override;
++	void UpdateConnVal(RecordVal* conn_val) override;
++
++	// True if the connection has closed in some sense, false otherwise.
++	bool IsClosed() const	{ return orig->did_close || resp->did_close; }
++	bool BothClosed() const	{ return orig->did_close && resp->did_close; }
++
++	bool IsPartial() const	{ return is_partial; }
++
++	bool HadGap(bool orig) const;
++
++	analyzer::tcp::TCP_Endpoint* Orig() const	{ return orig; }
++	analyzer::tcp::TCP_Endpoint* Resp() const	{ return resp; }
++	int OrigState() const	{ return orig->state; }
++	int RespState() const	{ return resp->state; }
++	int OrigPrevState() const	{ return orig->prev_state; }
++	int RespPrevState() const	{ return resp->prev_state; }
++	uint32_t OrigSeq() const	{ return orig->LastSeq(); }
++	uint32_t RespSeq() const	{ return resp->LastSeq(); }
++
++	// True if either endpoint still has pending data.  closing_endp
++	// is an endpoint that has indicated it is closing (i.e., for
++	// which we have seen a FIN) - for it, data is pending unless
++	// everything's been delivered up to the FIN.  For its peer,
++	// the test is whether it has any outstanding, un-acked data.
++	bool DataPending(analyzer::tcp::TCP_Endpoint* closing_endp);
++
++private:
++
++	friend class TCPAnalyzer;
++
++	analyzer::tcp::TCP_Endpoint* orig = nullptr;
++	analyzer::tcp::TCP_Endpoint* resp = nullptr;
++
++	analyzer::analyzer_list packet_children;
++
++	bool first_packet_seen = false;
++	bool reassembling = false;
++	bool is_partial = false;
++	bool is_active = false;
++	bool finished = false;
++
++	// Whether we're waiting on final data delivery before closing
++	// this connection.
++	bool close_deferred = false;
++
++	// Whether to generate an event when we finally do close it.
++	bool deferred_gen_event = false;
++
++	// Whether we have seen the first ACK from the originator.
++	bool seen_first_ACK = false;
++
++	void UpdateEndpointVal(const ValPtr& endp_arg, bool is_orig);
++
++	void SetPartialStatus(analyzer::tcp::TCP_Flags flags, bool is_orig);
++	void SynWeirds(analyzer::tcp::TCP_Flags flags,
++	               analyzer::tcp::TCP_Endpoint* endpoint, int data_len) const;
++
++	friend class session::detail::Timer;
++	void AttemptTimer(double t);
++	void PartialCloseTimer(double t);
++	void ExpireTimer(double t);
++	void ResetTimer(double t);
++	void DeleteTimer(double t);
++	void ConnDeleteTimer(double t);
++
++	void EndpointEOF(TCP_Reassembler* endp);
++	void ConnectionClosed(TCP_Endpoint* endpoint,
++					TCP_Endpoint* peer, bool gen_event);
++	void ConnectionFinished(bool half_finished);
++	void ConnectionReset();
++	void PacketWithRST();
++
++	// Update the state machine of the TCPs based on the activity.  This
++	// includes our pseudo-states such as TCP_ENDPOINT_PARTIAL.
++	//
++	// On return, do_close is true if we should consider the connection
++	// as closed, and gen_event if we shouuld generate an event about
++	// this fact.
++	void UpdateStateMachine(double t,
++	                        analyzer::tcp::TCP_Endpoint* endpoint,
++	                        analyzer::tcp::TCP_Endpoint* peer,
++	                        uint32_t base_seq, uint32_t ack_seq,
++	                        int len, int32_t delta_last, bool is_orig,
++	                        analyzer::tcp::TCP_Flags flags,
++	                        bool& do_close, bool& gen_event);
++
++	void UpdateInactiveState(double t,
++	                         analyzer::tcp::TCP_Endpoint* endpoint,
++	                         analyzer::tcp::TCP_Endpoint* peer,
++	                         uint32_t base_seq, uint32_t ack_seq,
++	                         int len, bool is_orig, analyzer::tcp::TCP_Flags flags,
++	                         bool& do_close, bool& gen_event);
++
++	void UpdateSYN_SentState(analyzer::tcp::TCP_Endpoint* endpoint,
++	                         analyzer::tcp::TCP_Endpoint* peer,
++	                         int len, bool is_orig, analyzer::tcp::TCP_Flags flags,
++	                         bool& do_close, bool& gen_event);
++
++	void UpdateEstablishedState(analyzer::tcp::TCP_Endpoint* endpoint,
++	                            analyzer::tcp::TCP_Endpoint* peer,
++	                            analyzer::tcp::TCP_Flags flags, bool& do_close,
++	                            bool& gen_event);
++
++	void UpdateClosedState(double t, analyzer::tcp::TCP_Endpoint* endpoint,
++	                       int32_t delta_last, analyzer::tcp::TCP_Flags flags,
++	                       bool& do_close);
++
++	void UpdateResetState(int len, analyzer::tcp::TCP_Flags flags);
++	};
++
++	} // namespace zeek::packet_analysis::TCP
