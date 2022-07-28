@@ -1,0 +1,170 @@
+diff --git a/ci/macos/check_version.py b/ci/macos/check_version.py
+new file mode 100644
+index 000000000..eafd8c469
+--- /dev/null
++++ b/ci/macos/check_version.py
+@@ -0,0 +1,72 @@
++import argparse
++import json
++import subprocess
++import sys
++
++from packaging.version import parse as parse_version
++from parse import parse as parse_string
++
++def parse_openssl(ver_str):
++
++    ver = parse_string("{:d}.{:d}.{:d}{:3l}", ver_str)
++    if ver:
++        return ver
++
++    ver = parse_string("{:d}.{:d}.{:d}", ver_str)
++    return ver
++
++parser = argparse.ArgumentParser()
++group = parser.add_mutually_exclusive_group(required=True)
++group.add_argument('--get_brew_version', metavar='package', type=str)
++group.add_argument('--compare_openssl', nargs=2, metavar=('current','expected'), type=str)
++group.add_argument('--compare', nargs=2, metavar=('current','expected'), type=str)
++
++args = parser.parse_args()
++
++if args.get_brew_version:
++
++    binary = args.get_brew_version
++    proc = subprocess.run(['brew','info','--json=v1',binary], capture_output=True)
++    j = json.loads(proc.stdout)
++    if len(j) == 0:
++        print('')
++        sys.exit(0)
++
++    installed = j[0].get('installed',[])
++    if len(installed) == 0:
++        print('')
++        sys.exit(0)
++
++    print(installed[0].get('version', ''))
++
++elif args.compare:
++
++    current = parse_version(args.compare[0])
++    expected = parse_version(args.compare[1])
++
++    if current < expected:
++        sys.exit(1)
++
++elif args.compare_openssl:
++
++    current = parse_openssl(args.compare_openssl[0])
++    expected = parse_openssl(args.compare_openssl[1])
++    current_num_only = '{:d}.{:d}.{:d}'.format(current[0], current[1], current[2])
++    expected_num_only = '{:d}.{:d}.{:d}'.format(expected[0], expected[1], expected[2])
++
++    current_letters = ''
++    if len(current.fixed) == 4:
++        current_letters = current[3]
++
++    expected_letters = ''
++    if len(expected.fixed) == 4:
++        expected_letters = expected[3]
++
++    current = parse_version(current_num_only)
++    expected = parse_version(expected_num_only)
++
++    if current < expected:
++        sys.exit(1)
++
++    if current == expected and current_letters < expected_letters:
++        sys.exit(1)
+diff --git a/ci/macos/prepare.sh b/ci/macos/prepare.sh
+index f76d94894..7da778f67 100755
+--- a/ci/macos/prepare.sh
++++ b/ci/macos/prepare.sh
+@@ -1,11 +1,84 @@
+ #!/bin/sh
+ 
++SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
++
+ echo "Preparing macOS environment"
+ sysctl hw.model hw.machine hw.ncpu hw.physicalcpu hw.logicalcpu
+ set -e
+ set -x
+ 
+-brew update
+-brew upgrade cmake openssl@1.1
+-brew install swig bison flex ccache
+ python3 -m pip install --user websockets
++
++# This is used to compare version numbers between what's installed and what's
++# expected from the packages we install via brew. We check the version numbers
++# to avoid a lenghty update process that might not need to run.
++python3 -m pip install --user packaging
++python3 -m pip install --user parse
++
++# TODO: add checks for flex and ccache
++DO_UPDATE=0
++
++# First try to grab the version number of each installed package from brew,
++# but if that fails try to query it from the binary itself.
++OPENSSL_VERSION=$(python3 ${SCRIPT_DIR}/check_version.py --get_brew_version openssl)
++if [ -z "${OPENSSL_VERSION}" ]; then
++    if which openssl; then
++	OPENSSL_VERSION=$(openssl version | awk '{print $2}')
++    else
++	DO_UPDATE=1
++    fi
++fi
++
++CMAKE_VERSION=$(python3 ${SCRIPT_DIR}/check_version.py --get_brew_version cmake)
++if [ -z "${CMAKE_VERSION}" ]; then
++    if which cmake; then
++	CMAKE_VERSION=$(cmake --version | head -1 | awk '{print $3}')
++    else
++	DO_UPDATE=1
++    fi
++fi
++
++SWIG_VERSION=$(python3 ${SCRIPT_DIR}/check_version.py --get_brew_version swig)
++if [ -z "${SWIG_VERSION}" ]; then
++    if which swig; then
++	SWIG_VERSION=$(swig -version | head -2 | awk 'NF {print $3}')
++    else
++	DO_UPDATE=1
++    fi
++fi
++
++BISON_VERSION=$(python3 ${SCRIPT_DIR}/check_version.py --get_brew_version bison)
++if [ -z "${BISON_VERSION}" ]; then
++    if which bison; then
++	BISON_VERSION=$(bison --version | head -1 | awk '{print $4}')
++    else
++	DO_UPDATE=1
++    fi
++fi
++
++echo "Current openssl: ${OPENSSL_VERSION:=not installed}"
++echo "Current cmake: ${CMAKE_VERSION:=not installed}"
++echo "Current swig: ${SWIG_VERSION:=not installed}"
++echo "Current bison: ${BISON_VERSION:=not installed}"
++
++if [ ${DO_UPDATE} -eq 0 ]; then
++
++    if ! python3 ${SCRIPT_DIR}/check_version.py --compare_openssl "${OPENSSL_VERSION}" "1.1.1l"; then
++	DO_UPDATE=1
++    elif ! python3 ${SCRIPT_DIR}/check_version.py --compare "${CMAKE_VERSION}" "3.20.0"; then
++	DO_UPDATE=1
++    elif ! python3 ${SCRIPT_DIR}/check_version.py --compare "${SWIG_VERSION}" "4.0.0"; then
++	DO_UPDATE=1
++    elif ! python3 ${SCRIPT_DIR}/check_version.py --compare "${BISON_VERSION}" "3.8.0"; then
++	DO_UPDATE=1
++    fi
++
++fi
++
++if [ ${DO_UPDATE} -eq 1 ]; then
++
++    brew update
++    brew upgrade cmake openssl@1.1
++    brew install swig bison flex ccache
++
++fi
