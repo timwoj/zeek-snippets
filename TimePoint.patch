@@ -1,0 +1,368 @@
+diff --git a/auxil/bifcl b/auxil/bifcl
+index d2316ae36..bd77df8fb 160000
+--- a/auxil/bifcl
++++ b/auxil/bifcl
+@@ -1 +1 @@
+-Subproject commit d2316ae3615c3d3fa50e4de07445a575a06243b6
++Subproject commit bd77df8fb54be1644ffdd06966dcf9cf0f10b9ac-dirty
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 3732a55ce..7e1b534c2 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -370,6 +370,7 @@ set(MAIN_SRCS
+     WeirdState.cc
+     ZeekArgs.cc
+     ZeekString.cc
++    ZeekTime.cc
+     ZVal.cc
+ 
+     ${SUPERVISOR_SRCS}
+diff --git a/src/Stats.cc b/src/Stats.cc
+index 4aee9155b..c9d52bda6 100644
+--- a/src/Stats.cc
++++ b/src/Stats.cc
+@@ -336,7 +336,7 @@ void SampleLogger::SegmentProfile(const char* /* name */, const Location* /* loc
+ 	{
+ 	if ( load_sample )
+ 		event_mgr.Enqueue(load_sample, IntrusivePtr{NewRef{}, load_samples},
+-		                  make_intrusive<IntervalVal>(dtime, zeek::IntervalVal::Seconds),
++		                  make_intrusive<IntervalVal>(dtime, zeek::time::Seconds),
+ 		                  val_mgr->Int(dmem));
+ 	}
+ 
+diff --git a/src/Val.cc b/src/Val.cc
+index 28c2dcbad..22f702e7c 100644
+--- a/src/Val.cc
++++ b/src/Val.cc
+@@ -616,13 +616,23 @@ StringValPtr Val::ToJSON(bool only_loggable, RE_Matcher* re)
+ 	return make_intrusive<StringVal>(buffer.GetString());
+ 	}
+ 
++IntervalVal::IntervalVal(double quantity, double units) : Val(base_type(TYPE_INTERVAL))
++	{
++	double v = quantity * units;
++	tp.s = static_cast<int64_t>(v);
++	v -= static_cast<double>(tp.s);
++
++	tp.ns = static_cast<uint64_t>(v * 1000000.0);
++	}
++
+ void IntervalVal::ValDescribe(ODesc* d) const
+ 	{
+ 	using unit_word = std::pair<double, const char*>;
+ 
+ 	constexpr std::array<unit_word, 6> units = {
+-		unit_word{Days, "day"},    unit_word{Hours, "hr"},          unit_word{Minutes, "min"},
+-		unit_word{Seconds, "sec"}, unit_word{Milliseconds, "msec"}, unit_word{Microseconds, "usec"},
++		unit_word{time::Days, "day"},          unit_word{time::Hours, "hr"},
++		unit_word{time::Minutes, "min"},       unit_word{time::Seconds, "sec"},
++		unit_word{time::Milliseconds, "msec"}, unit_word{time::Microseconds, "usec"},
+ 	};
+ 
+ 	double v = AsDouble();
+@@ -685,6 +695,14 @@ void IntervalVal::ValDescribe(ODesc* d) const
+ 		}
+ 	}
+ 
++TimeVal::TimeVal(double time) : Val(base_type(TYPE_INTERVAL))
++	{
++	tp.s = static_cast<int64_t>(time);
++	time -= static_cast<double>(tp.s);
++
++	tp.ns = static_cast<uint64_t>(time * 1000000.0);
++	}
++
+ ValPtr PortVal::SizeVal() const
+ 	{
+ 	return val_mgr->Int(uint_val);
+diff --git a/src/Val.h b/src/Val.h
+index 899421b26..38c85f0ef 100644
+--- a/src/Val.h
++++ b/src/Val.h
+@@ -14,6 +14,7 @@
+ #include "zeek/Timer.h"
+ #include "zeek/Type.h"
+ #include "zeek/ZVal.h"
++#include "zeek/ZeekTime.h"
+ #include "zeek/net_util.h"
+ 
+ // We have four different port name spaces: TCP, UDP, ICMP, and UNKNOWN.
+@@ -158,8 +159,8 @@ public:
+ 	UNDERLYING_ACCESSOR_DECL(EnumVal, zeek_int_t, AsEnum)
+ 	UNDERLYING_ACCESSOR_DECL(detail::UnsignedValImplementation, zeek_uint_t, AsCount)
+ 	UNDERLYING_ACCESSOR_DECL(detail::DoubleValImplementation, double, AsDouble)
+-	UNDERLYING_ACCESSOR_DECL(TimeVal, double, AsTime)
+-	UNDERLYING_ACCESSOR_DECL(IntervalVal, double, AsInterval)
++	UNDERLYING_ACCESSOR_DECL(TimeVal, zeek::time::TimePoint, AsTime)
++	UNDERLYING_ACCESSOR_DECL(IntervalVal, zeek::time::TimePoint, AsInterval)
+ 	UNDERLYING_ACCESSOR_DECL(AddrVal, const IPAddr&, AsAddr)
+ 	UNDERLYING_ACCESSOR_DECL(SubNetVal, const IPPrefix&, AsSubNet)
+ 	UNDERLYING_ACCESSOR_DECL(StringVal, const String*, AsString)
+@@ -429,33 +430,55 @@ public:
+ 	// Same as for IntVal: no Get() method needed.
+ 	};
+ 
+-class IntervalVal final : public detail::DoubleValImplementation
++class IntervalVal final : public Val
+ 	{
+ public:
+-	constexpr static double Microseconds = 1e-6;
+-	constexpr static double Milliseconds = 1e-3;
+-	constexpr static double Seconds = 1.0;
+-	constexpr static double Minutes = (60 * Seconds);
+-	constexpr static double Hours = (60 * Minutes);
+-	constexpr static double Days = (24 * Hours);
+-
+-	IntervalVal(double quantity, double units = Seconds)
+-		: detail::DoubleValImplementation(base_type(TYPE_INTERVAL), quantity * units)
++	IntervalVal(int64_t seconds, uint64_t nanoseconds)
++		: Val(base_type(TYPE_INTERVAL)), tp{seconds, nanoseconds}
+ 		{
+ 		}
++	explicit IntervalVal(double quantity, double units = time::Seconds);
++	IntervalVal(const time::TimePoint& time) : IntervalVal(time.s, time.ns) { }
+ 
+-	// Same as for IntVal: no Get() method needed.
++	IntervalVal(const IntervalVal& other)
++		: Val(base_type(TYPE_INTERVAL)), tp{other.tp.s, other.tp.ns}
++		{
++		}
++	IntervalVal(IntervalVal&& other) noexcept
++		: Val(base_type(TYPE_INTERVAL)), tp{other.tp.s, other.tp.ns}
++		{
++		}
+ 
+-protected:
++	int64_t Seconds() const { return tp.s; }
++	uint64_t Nanosecs() const { return tp.ns; }
++	time::TimePoint Get() const { return tp; }
++
++private:
+ 	void ValDescribe(ODesc* d) const override;
++	time::TimePoint tp;
+ 	};
+ 
+-class TimeVal final : public detail::DoubleValImplementation
++class TimeVal final : public Val
+ 	{
+ public:
+-	TimeVal(double t) : detail::DoubleValImplementation(base_type(TYPE_TIME), t) { }
++	TimeVal(int64_t seconds, uint64_t nanoseconds)
++		: Val(base_type(TYPE_TIME)), tp{seconds, nanoseconds}
++		{
++		}
++	TimeVal(double time);
++	TimeVal(const time::TimePoint& time) : TimeVal(time.s, time.ns) { }
+ 
+-	// Same as for IntVal: no Get() method needed.
++	TimeVal(const TimeVal& other) : Val(base_type(TYPE_INTERVAL)), tp{other.tp.s, other.tp.ns} { }
++	TimeVal(TimeVal&& other) noexcept : Val(base_type(TYPE_INTERVAL)), tp{other.tp.s, other.tp.ns}
++		{
++		}
++
++	int64_t Seconds() const { return tp.s; }
++	uint64_t Nanosecs() const { return tp.ns; }
++	time::TimePoint Get() const { return tp; }
++
++private:
++	time::TimePoint tp;
+ 	};
+ 
+ class PortVal final : public detail::UnsignedValImplementation
+@@ -1708,8 +1731,8 @@ UNDERLYING_ACCESSOR_DEF(BoolVal, bool, AsBool)
+ UNDERLYING_ACCESSOR_DEF(EnumVal, zeek_int_t, AsEnum)
+ UNDERLYING_ACCESSOR_DEF(detail::UnsignedValImplementation, zeek_uint_t, AsCount)
+ UNDERLYING_ACCESSOR_DEF(detail::DoubleValImplementation, double, AsDouble)
+-UNDERLYING_ACCESSOR_DEF(TimeVal, double, AsTime)
+-UNDERLYING_ACCESSOR_DEF(IntervalVal, double, AsInterval)
++UNDERLYING_ACCESSOR_DEF(TimeVal, zeek::time::TimePoint, AsTime)
++UNDERLYING_ACCESSOR_DEF(IntervalVal, zeek::time::TimePoint, AsInterval)
+ UNDERLYING_ACCESSOR_DEF(SubNetVal, const IPPrefix&, AsSubNet)
+ UNDERLYING_ACCESSOR_DEF(AddrVal, const IPAddr&, AsAddr)
+ UNDERLYING_ACCESSOR_DEF(StringVal, const String*, AsString)
+diff --git a/src/ZVal.cc b/src/ZVal.cc
+index 2f6ae207b..2ad8b71c8 100644
+--- a/src/ZVal.cc
++++ b/src/ZVal.cc
+@@ -210,7 +210,7 @@ ValPtr ZVal::ToVal(const TypePtr& t) const
+ 			return make_intrusive<DoubleVal>(double_val);
+ 
+ 		case TYPE_INTERVAL:
+-			return make_intrusive<IntervalVal>(double_val, zeek::IntervalVal::Seconds);
++			return make_intrusive<IntervalVal>(double_val, zeek::time::Seconds);
+ 
+ 		case TYPE_TIME:
+ 			return make_intrusive<TimeVal>(double_val);
+diff --git a/src/ZeekTime.cc b/src/ZeekTime.cc
+new file mode 100644
+index 000000000..2ee97580f
+--- /dev/null
++++ b/src/ZeekTime.cc
+@@ -0,0 +1,31 @@
++#include "zeek/ZeekTime.h"
++
++using namespace zeek::time;
++
++TimePoint::TimePoint(struct timespec& tv) { }
++
++TimePoint::TimePoint(double quantity, double units) { }
++
++TimePoint::operator double() const
++	{
++	return 0.0;
++	}
++
++TimePoint::operator bool() const
++	{
++	return true;
++	}
++
++bool TimePoint::operator=(int value) const
++	{
++	return true;
++	}
++
++bool TimePoint::operator=(double value) const
++	{
++	return true;
++	}
++
++TimePoint& TimePoint::operator-(const TimePoint& other) { }
++
++TimePoint& TimePoint::operator+(const TimePoint& other) { }
+diff --git a/src/ZeekTime.h b/src/ZeekTime.h
+new file mode 100644
+index 000000000..c4b4a7d95
+--- /dev/null
++++ b/src/ZeekTime.h
+@@ -0,0 +1,45 @@
++#pragma once
++
++#include <sys/time.h>
++#include <cstdint>
++#include <ctime>
++
++namespace zeek::time
++	{
++constexpr double Microseconds = 1e-6;
++constexpr double Milliseconds = 1e-3;
++constexpr double Seconds = 1.0;
++constexpr double Minutes = (60 * Seconds);
++constexpr double Hours = (60 * Minutes);
++constexpr double Days = (24 * Hours);
++
++class TimePoint
++	{
++public:
++	TimePoint() = default;
++	TimePoint(struct timespec& tv);
++	explicit TimePoint(int64_t s, uint64_t ns) : s(s), ns(s) { }
++	explicit TimePoint(double quantity, double units);
++
++	TimePoint(const TimePoint& other) = default;
++	TimePoint(TimePoint&& other) = default;
++
++	TimePoint& operator=(const TimePoint& other) = default;
++	TimePoint& operator=(TimePoint&& other) = default;
++
++	bool operator==(const TimePoint& other) const { return s == other.s && ns == other.ns; }
++	bool operator!=(const TimePoint& other) const { return s != other.s || ns != other.ns; }
++
++	explicit operator double() const;
++	explicit operator bool() const;
++	bool operator=(int value) const;
++	bool operator=(double value) const;
++
++	TimePoint& operator-(const TimePoint& other);
++	TimePoint& operator+(const TimePoint& other);
++
++	// These are intentionally public so we don't have to call getters/setters.
++	int64_t s;
++	uint64_t ns;
++	};
++	}
+diff --git a/src/analyzer/protocol/conn-size/ConnSize.h b/src/analyzer/protocol/conn-size/ConnSize.h
+index f8b748190..16da79562 100644
+--- a/src/analyzer/protocol/conn-size/ConnSize.h
++++ b/src/analyzer/protocol/conn-size/ConnSize.h
+@@ -24,8 +24,16 @@ public:
+ 	void SetByteAndPacketThreshold(uint64_t threshold, bool bytes, bool orig);
+ 	uint64_t GetByteAndPacketThreshold(bool bytes, bool orig);
+ 
+-	void SetDurationThreshold(double duration);
+-	double GetDurationThreshold() { return duration_thresh; };
++	[[deprecated("Remove in v6.1. Use version that takes zeek::time::TimePoint")]] void
++	SetDurationThreshold(double duration);
++	[[deprecated("Remove in v6.1. Use version that returns zeek::time::TimePoint")]] double
++	GetDurationThreshold()
++		{
++		return (double)duration_thresh;
++		};
++
++	void SetDurationThreshold(const time::TimePoint& duration);
++	time::TimePoint GetDurationThresholdTime() { return duration_thresh; }
+ 
+ 	static analyzer::Analyzer* Instantiate(Connection* conn) { return new ConnSize_Analyzer(conn); }
+ 
+@@ -47,7 +55,7 @@ protected:
+ 	uint64_t resp_pkts_thresh;
+ 
+ 	double start_time;
+-	double duration_thresh;
++	time::TimePoint duration_thresh;
+ 	};
+ 
+ 	} // namespace zeek::analyzer::conn_size
+diff --git a/src/packet_analysis/protocol/icmp/ICMP.cc b/src/packet_analysis/protocol/icmp/ICMP.cc
+index be8347f4c..f89609959 100644
+--- a/src/packet_analysis/protocol/icmp/ICMP.cc
++++ b/src/packet_analysis/protocol/icmp/ICMP.cc
+@@ -508,10 +508,9 @@ void ICMPAnalyzer::RouterAdvert(double t, const struct icmp* icmpp, int len, int
+ 		val_mgr->Count((icmpp->icmp_wpa & 0x18) >> 3), // Pref
+ 		val_mgr->Bool(icmpp->icmp_wpa & 0x04), // Proxy
+ 		val_mgr->Count(icmpp->icmp_wpa & 0x02), // Reserved
+-		make_intrusive<IntervalVal>((double)ntohs(icmpp->icmp_lifetime),
+-	                                zeek::IntervalVal::Seconds),
+-		make_intrusive<IntervalVal>((double)ntohl(reachable), zeek::IntervalVal::Milliseconds),
+-		make_intrusive<IntervalVal>((double)ntohl(retrans), zeek::IntervalVal::Milliseconds),
++		make_intrusive<IntervalVal>((double)ntohs(icmpp->icmp_lifetime), zeek::time::Seconds),
++		make_intrusive<IntervalVal>((double)ntohl(reachable), zeek::time::Milliseconds),
++		make_intrusive<IntervalVal>((double)ntohl(retrans), zeek::time::Milliseconds),
+ 		BuildNDOptionsVal(caplen - opt_offset, data + opt_offset, adapter));
+ 	}
+ 
+@@ -724,9 +723,9 @@ zeek::VectorValPtr ICMPAnalyzer::BuildNDOptionsVal(int caplen, const u_char* dat
+ 						info->Assign(1, val_mgr->Bool(L_flag));
+ 						info->Assign(2, val_mgr->Bool(A_flag));
+ 						info->Assign(3, make_intrusive<IntervalVal>((double)ntohl(valid_life),
+-						                                            zeek::IntervalVal::Seconds));
++						                                            zeek::time::Seconds));
+ 						info->Assign(4, make_intrusive<IntervalVal>((double)ntohl(prefer_life),
+-						                                            zeek::IntervalVal::Seconds));
++						                                            zeek::time::Seconds));
+ 						info->Assign(5, make_intrusive<AddrVal>(IPAddr(prefix)));
+ 						rv->Assign(3, std::move(info));
+ 						}
+diff --git a/src/scan.l b/src/scan.l
+index bb7780803..479333c3d 100644
+--- a/src/scan.l
++++ b/src/scan.l
+@@ -518,12 +518,12 @@ F	RET_CONST(zeek::val_mgr->False()->Ref())
+ 		RET_CONST(zeek::val_mgr->Port(p, TRANSPORT_UNKNOWN)->Ref())
+ 		}
+ 
+-{FLOAT}{OWS}day(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::IntervalVal::Days))
+-{FLOAT}{OWS}hr(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::IntervalVal::Hours))
+-{FLOAT}{OWS}min(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::IntervalVal::Minutes))
+-{FLOAT}{OWS}sec(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::IntervalVal::Seconds))
+-{FLOAT}{OWS}msec(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::IntervalVal::Milliseconds))
+-{FLOAT}{OWS}usec(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::IntervalVal::Microseconds))
++{FLOAT}{OWS}day(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::time::Days))
++{FLOAT}{OWS}hr(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::time::Hours))
++{FLOAT}{OWS}min(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::time::Minutes))
++{FLOAT}{OWS}sec(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::time::Seconds))
++{FLOAT}{OWS}msec(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::time::Milliseconds))
++{FLOAT}{OWS}usec(s?)	RET_CONST(new zeek::IntervalVal(atof(yytext),zeek::time::Microseconds))
+ 
+ "0x"{HEX}+	RET_CONST(zeek::val_mgr->Count(static_cast<zeek_uint_t>(strtoull(yytext, 0, 16))).release())
+ 
