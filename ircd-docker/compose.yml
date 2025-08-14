@@ -1,0 +1,58 @@
+networks:
+  irc:
+    ipam:
+      driver: default
+      config:
+        - subnet: "172.16.238.0/24"
+
+services:
+  ircd1:
+    image: inspircd/inspircd-docker
+    ports:
+      - 6667:6667
+    networks:
+      irc:
+        ipv4_address: 172.16.238.10
+    environment:
+      - INSP_NET_SUFFIX=.local
+      - INSP_NET_NAME=ircd1
+      - INSP_SERVER_NAME=ircd1.local
+      - INSP_CONNECT_PASSWORD=test
+      - INSP_ADMIN_NAME=Tim Wojtulewicz
+      - INSP_ADMIN_NICK=tim
+      - INSP_ADMIN_EMAIL=tim@corelight.com
+      - INSP_OPER_NAME=tim
+      # This is the response from '/quote mkpasswd bcrypt test'
+      - INSP_OPER_PASSWORD_HASH=$2a$10$9MLZZIpFch8GZKDYxvUJiePbSB6atXN/0ELlbKfApUAp2UiEAtBa.
+      - INSP_OPER_HASH=bcrypt
+      - INSP_OPER_SSLONLY=no
+      - INSP_LINK1_NAME=ircd2.local
+      - INSP_LINK1_IPADDR=172.16.238.11
+      - INSP_LINK1_PASSWORD=password
+      - INSP_LINK1_TLS_ON=no
+      - INSP_LINK1_AUTOCONNECT=no
+  ircd2:
+    image: inspircd/inspircd-docker
+    ports:
+      - 6668:6667
+    networks:
+      irc:
+        ipv4_address: 172.16.238.11
+    environment:
+      - INSP_NET_SUFFIX=.local
+      - INSP_NET_NAME=ircd2
+      - INSP_SERVER_NAME=ircd2.local
+      - INSP_CONNECT_PASSWORD=test
+      - INSP_ADMIN_NAME=Tim Wojtulewicz
+      - INSP_ADMIN_NICK=tim
+      - INSP_ADMIN_EMAIL=tim@corelight.com
+      - INSP_OPER_NAME=tim
+      # This is the response from '/quote mkpasswd bcrypt test'
+      - INSP_OPER_PASSWORD_HASH=$2a$10$9MLZZIpFch8GZKDYxvUJiePbSB6atXN/0ELlbKfApUAp2UiEAtBa.
+      - INSP_OPER_HASH=bcrypt
+      - INSP_OPER_SSLONLY=no
+      - INSP_LINK1_NAME=ircd1.local
+      - INSP_LINK1_IPADDR=172.16.238.10
+      - INSP_LINK1_PASSWORD=password
+      - INSP_LINK1_TLS_ON=no
+      - INSP_LINK1_AUTOCONNECT=no
